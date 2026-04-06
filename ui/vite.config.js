@@ -16,4 +16,9 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
   },
+  optimizeDeps: {
+    rolldownOptions: {
+      // Add any specific rollup options here if needed
+    },
+  },
 })
