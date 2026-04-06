@@ -24,7 +24,8 @@ async def _search_ddg(query: str) -> list[dict]:
             results = list(ddgs.text(query, max_results=MAX_RESULTS))
         return results
     except Exception as e:
-        logger.warning(f"[web_search] DDG failed: {e}")
+        error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
+        logger.warning(f"[web_search] DDG failed: {error_msg}")
         return []
 
 
@@ -44,7 +45,8 @@ async def _search_brave(query: str, api_key: str) -> list[dict]:
                 for w in data.get("web", {}).get("results", [])
             ]
     except Exception as e:
-        logger.warning(f"[web_search] Brave failed: {e}")
+        error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
+        logger.warning(f"[web_search] Brave failed: {error_msg}")
         return []
 
 
