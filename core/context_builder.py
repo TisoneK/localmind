@@ -16,7 +16,20 @@ import tiktoken
 from core.models import EngineContext, Message, Role
 from core.config import settings
 
-_ENCODER = tiktoken.get_encoding("cl100k_base")
+_ENCODER = None
+
+def _get_encoder():
+    global _ENCODER
+    if _ENCODER is None:
+        try:
+            _ENCODER = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            # Fallback: rough token estimate (1 token ≈ 4 chars) when tiktoken unavailable
+            class _FallbackEncoder:
+                def encode(self, text: str) -> list:
+                    return list(range(len(text) // 4))
+            _ENCODER = _FallbackEncoder()
+    return _ENCODER
 
 SYSTEM_PROMPT = """You are LocalMind, a helpful AI assistant running entirely on the user's local machine.
 You have access to tools that let you read files, search the web, run code, and remember things across conversations.
@@ -27,7 +40,7 @@ Keep responses clear and concise. Use markdown formatting when it helps readabil
 
 
 def _count_tokens(text: str) -> int:
-    return len(_ENCODER.encode(text))
+    return len(_get_encoder().encode(text))
 
 
 def _messages_tokens(messages: list[dict]) -> int:

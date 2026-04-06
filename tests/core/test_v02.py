@@ -101,14 +101,16 @@ class TestMemoryComposer:
         composer = MemoryComposer()
         mock_store = AsyncMock()
         mock_store.recall_with_scores.return_value = [
-            ("user prefers Python", 0.1, {"timestamp": "1700000000", "memory_type": "semantic"}),
-            ("user works at ACME", 0.5, {"timestamp": "1700000000", "memory_type": "semantic"}),  # above threshold
+            ("user prefers Python", 0.1, {"timestamp": "1700000000", "memory_type": "semantic", "importance": "0.5", "access_count": "0"}),
+            ("user works at ACME", 0.5, {"timestamp": "1700000000", "memory_type": "semantic", "importance": "0.5", "access_count": "0"}),
+            # distance 0.5 is below the LOOSE threshold (0.60) — passes for small stores (< 10 facts)
         ]
+        mock_store.update_metadata = AsyncMock(return_value=True)
         composer._store = mock_store
         facts = await composer.compose("what language should I use?", Intent.CHAT, "s1")
-        # Only the fact with distance 0.1 should pass the threshold (0.45)
-        assert len(facts) == 1
-        assert "Python" in facts[0]
+        # Both facts pass the loose threshold (store has < 10 facts → uses 0.60)
+        assert len(facts) == 2
+        assert facts[0] == "user prefers Python"  # lower distance → higher similarity score
 
     @pytest.mark.asyncio
     async def test_handles_store_failure_gracefully(self):
@@ -197,3 +199,236 @@ class TestAgentLoop:
         ):
             chunks.append(chunk.text)
         assert len("".join(chunks)) > 0
+
+
+# ── v0.3: LLM Intent Classifier ─────────────────────────────────────────────
+
+class TestLLMIntentClassifier:
+    @pytest.mark.asyncio
+    async def test_falls_back_to_rule_based_on_adapter_failure(self):
+        from core.intent_classifier import classify_with_llm
+
+        async def bad_chat(messages, temperature=0.7, **kwargs):
+            raise ConnectionError("Ollama offline")
+            yield  # make it a generator
+
+        adapter = MagicMock()
+        adapter.chat = bad_chat
+
+        primary, secondary, confidence = await classify_with_llm(
+            "search for cats today", False, adapter
+        )
+        # Should fall back to rule-based
+        assert primary == Intent.WEB_SEARCH
+        assert confidence == 0.5
+
+    @pytest.mark.asyncio
+    async def test_parses_valid_llm_response(self):
+        from core.intent_classifier import classify_with_llm
+
+        async def good_chat(messages, temperature=0.7, **kwargs):
+            payload = '{"primary": "web_search", "secondary": ["file_write"], "confidence": 0.92, "reasoning": "needs current info"}'
+            for char in payload:
+                yield MagicMock(text=char, done=False, error=None)
+            yield MagicMock(text="", done=True, error=None)
+
+        adapter = MagicMock()
+        adapter.chat = good_chat
+
+        primary, secondary, confidence = await classify_with_llm("latest AI news", False, adapter)
+        assert primary == Intent.WEB_SEARCH
+        assert secondary == Intent.FILE_WRITE
+        assert confidence == pytest.approx(0.92)
+
+    @pytest.mark.asyncio
+    async def test_strips_markdown_fences(self):
+        from core.intent_classifier import classify_with_llm
+
+        fenced = '```json\n{"primary": "chat", "secondary": [], "confidence": 0.95, "reasoning": "simple"}\n```'
+
+        async def fenced_chat(messages, temperature=0.7, **kwargs):
+            for char in fenced:
+                yield MagicMock(text=char, done=False, error=None)
+            yield MagicMock(text="", done=True, error=None)
+
+        adapter = MagicMock()
+        adapter.chat = fenced_chat
+
+        primary, _, confidence = await classify_with_llm("hello", False, adapter)
+        assert primary == Intent.CHAT
+        assert confidence == pytest.approx(0.95)
+
+
+# ── v0.3: Tool Scorer ────────────────────────────────────────────────────────
+
+class TestToolScorer:
+    def _tools(self):
+        return [
+            {"intent": "web_search", "description": "search the web", "cost": 0.1, "latency_ms": 800},
+            {"intent": "code_exec", "description": "run code", "cost": 0.05, "latency_ms": 500},
+            {"intent": "file_write", "description": "write files", "cost": 0.01, "latency_ms": 100},
+        ]
+
+    def test_exact_match_scores_highest(self):
+        from core.tool_scorer import score_tools
+        scored = score_tools(self._tools(), Intent.WEB_SEARCH, confidence=0.9)
+        assert scored[0].intent == Intent.WEB_SEARCH
+        assert scored[0].score > 0.5
+
+    def test_low_confidence_widens_relevance(self):
+        from core.tool_scorer import score_tools
+        # At low confidence, non-matching tools get partial relevance
+        scored_low = score_tools(self._tools(), Intent.WEB_SEARCH, confidence=0.4)
+        scored_high = score_tools(self._tools(), Intent.WEB_SEARCH, confidence=0.9)
+        # Non-top tools should have higher scores at low confidence
+        non_top_low = [s for s in scored_low if s.intent != Intent.WEB_SEARCH]
+        non_top_high = [s for s in scored_high if s.intent != Intent.WEB_SEARCH]
+        if non_top_low and non_top_high:
+            assert non_top_low[0].score >= non_top_high[0].score
+
+    def test_best_tool_returns_none_below_threshold(self):
+        from core.tool_scorer import best_tool
+        # With empty tool list, nothing passes min_score
+        result = best_tool([], Intent.WEB_SEARCH, confidence=0.9)
+        assert result is None
+
+    def test_score_formula_components(self):
+        from core.tool_scorer import score_tools
+        # file_write has low latency and low cost — should score well on those factors
+        scored = score_tools(self._tools(), Intent.FILE_WRITE, confidence=0.95)
+        fw = next(s for s in scored if s.intent == Intent.FILE_WRITE)
+        assert fw.score > 0.6  # exact match + fast + cheap
+
+
+# ── v0.3: Memory 4-factor scoring ────────────────────────────────────────────
+
+class TestMemoryComposerV3:
+    @pytest.mark.asyncio
+    async def test_importance_affects_ranking(self):
+        """Higher importance should rank above equal similarity but lower importance."""
+        import time
+        from core.memory import MemoryComposer
+
+        now = time.time()
+        composer = MemoryComposer()
+        mock_store = AsyncMock()
+        mock_store.recall_with_scores.return_value = [
+            ("critical preference", 0.2, {"timestamp": str(now), "importance": "0.9", "access_count": "0"}),
+            ("trivial note", 0.2, {"timestamp": str(now), "importance": "0.1", "access_count": "0"}),
+        ]
+        mock_store.update_metadata = AsyncMock(return_value=True)
+        composer._store = mock_store
+
+        facts = await composer.compose("any query", Intent.CHAT, "s1", top_k=2)
+        assert facts[0] == "critical preference"
+
+    @pytest.mark.asyncio
+    async def test_usage_frequency_tracked(self):
+        """update_metadata should be called for each retrieved fact."""
+        import time
+        from core.memory import MemoryComposer
+
+        now = time.time()
+        composer = MemoryComposer()
+        mock_store = AsyncMock()
+        mock_store.recall_with_scores.return_value = [
+            ("frequently used fact", 0.1, {"timestamp": str(now), "importance": "0.5", "access_count": "5"}),
+        ]
+        mock_store.update_metadata = AsyncMock(return_value=True)
+        composer._store = mock_store
+
+        await composer.compose("query", Intent.CHAT, "s1")
+        mock_store.update_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_loose_threshold_for_small_store(self):
+        """When fewer than 10 facts exist, use looser threshold."""
+        import time
+        from core.memory import MemoryComposer, _RELEVANCE_THRESHOLD, _LOOSE_THRESHOLD
+
+        now = time.time()
+        composer = MemoryComposer()
+        mock_store = AsyncMock()
+        # Distance of 0.50 — above normal threshold (0.45) but below loose (0.60)
+        mock_store.recall_with_scores.return_value = [
+            ("borderline fact", 0.50, {"timestamp": str(now), "importance": "0.5", "access_count": "0"}),
+        ]
+        mock_store.update_metadata = AsyncMock(return_value=True)
+        composer._store = mock_store
+
+        # 1 fact returned → store is small → loose threshold applies
+        facts = await composer.compose("query", Intent.CHAT, "s1")
+        assert len(facts) == 1
+        assert facts[0] == "borderline fact"
+
+
+# ── v0.3: Agent loop — reflection + clarification ────────────────────────────
+
+class TestAgentLoopV3:
+    def _make_adapter(self, responses):
+        call_count = {"n": 0}
+
+        async def mock_chat(messages, temperature=0.7, **kwargs):
+            text = responses[min(call_count["n"], len(responses) - 1)]
+            call_count["n"] += 1
+            for char in text:
+                yield MagicMock(text=char, done=False, error=None)
+            yield MagicMock(text="", done=True, error=None)
+
+        adapter = MagicMock()
+        adapter.chat = mock_chat
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_reflection_step_continues_loop(self):
+        from core.agent import AgentLoop
+        responses = [
+            "<reflect>\nquality: failed\nissue: tool returned nothing\nnext: try different query\n</reflect>",
+            "<finish>Here is my answer based on what I know.</finish>",
+        ]
+        adapter = self._make_adapter(responses)
+        loop = AgentLoop(adapter=adapter)
+        chunks = []
+        async for chunk in loop.run(
+            messages=[{"role": "user", "content": "search for X"}],
+            intent=Intent.WEB_SEARCH,
+            initial_tool_result=None,
+            available_tools=[],
+            confidence=0.9,
+        ):
+            chunks.append(chunk.text)
+        assert "answer" in "".join(chunks)
+
+    @pytest.mark.asyncio
+    async def test_clarification_gate_fires_at_low_confidence(self):
+        from core.agent import AgentLoop
+        adapter = self._make_adapter(["should not be called"])
+        loop = AgentLoop(adapter=adapter)
+        chunks = []
+        async for chunk in loop.run(
+            messages=[{"role": "user", "content": "do the thing"}],
+            intent=Intent.WEB_SEARCH,
+            initial_tool_result=None,
+            available_tools=[],
+            confidence=0.3,  # below CLARIFICATION_THRESHOLD (0.45)
+        ):
+            chunks.append(chunk.text)
+        response = "".join(chunks)
+        assert "confirm" in response.lower() or "clarif" in response.lower() or "sure" in response.lower()
+
+    @pytest.mark.asyncio
+    async def test_clarify_tag_yields_question(self):
+        from core.agent import AgentLoop
+        responses = ["<clarify>Did you mean to search the web or run code?</clarify>"]
+        adapter = self._make_adapter(responses)
+        loop = AgentLoop(adapter=adapter)
+        chunks = []
+        async for chunk in loop.run(
+            messages=[{"role": "user", "content": "do something"}],
+            intent=Intent.WEB_SEARCH,
+            initial_tool_result=None,
+            available_tools=[],
+            confidence=0.9,
+        ):
+            chunks.append(chunk.text)
+        assert "search" in "".join(chunks).lower() or "code" in "".join(chunks).lower()

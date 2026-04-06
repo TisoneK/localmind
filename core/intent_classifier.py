@@ -1,0 +1,101 @@
+"""
+LLM Intent Classifier — v0.3 replacement for rule-based pattern matching.
+
+Uses a lightweight model call with structured JSON output to classify intent
+with confidence scores. Falls back to rule-based classify_multi() on failure
+so the system always produces an answer.
+
+Output schema:
+    {
+        "primary": "web_search",
+        "secondary": ["file_write"],   // list, may be empty
+        "confidence": 0.92,
+        "reasoning": "user asks for current info + wants to save it"
+    }
+"""
+from __future__ import annotations
+import json
+import logging
+import re
+from typing import Optional
+
+from core.models import Intent
+from core import intent_router
+
+logger = logging.getLogger(__name__)
+
+_VALID_INTENTS = {i.value for i in Intent}
+
+_CLASSIFIER_SYSTEM = """You are an intent classifier for a local AI assistant.
+
+Classify the user message into one of these intents:
+- chat: general conversation, questions answerable from knowledge alone
+- web_search: needs current/live information, recent events, prices, news
+- code_exec: run/execute code, compute output, evaluate a script
+- memory_op: remember/recall/store user preferences or past info
+- file_task: read, parse, summarize an existing file
+- file_write: create, write, save content to a new file
+
+Rules:
+- Pick ONE primary intent (the main task)
+- List any secondary intents (supporting tasks, max 1)
+- Confidence: 0.0-1.0 how certain you are
+- If message has a file attached (has_file=true), primary is usually file_task
+
+Respond with ONLY valid JSON, no markdown, no explanation:
+{"primary": "intent_name", "secondary": [], "confidence": 0.9, "reasoning": "brief reason"}"""
+
+
+async def classify_with_llm(
+    message: str,
+    has_attachment: bool,
+    adapter,
+) -> tuple[Intent, Optional[Intent], float]:
+    """
+    Classify intent using the LLM. Returns (primary, secondary, confidence).
+    Falls back to rule-based on any failure.
+    """
+    user_content = f"has_file={str(has_attachment).lower()}\nmessage: {message}"
+    messages = [
+        {"role": "system", "content": _CLASSIFIER_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        chunks = []
+        async for chunk in adapter.chat(messages, temperature=0.0):
+            chunks.append(chunk.text)
+
+        raw = "".join(chunks).strip()
+
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        data = json.loads(raw)
+
+        primary_str = data.get("primary", "").strip().lower()
+        secondary_list = data.get("secondary", [])
+        confidence = float(data.get("confidence", 0.5))
+
+        if primary_str not in _VALID_INTENTS:
+            raise ValueError(f"Unknown intent: {primary_str!r}")
+
+        primary = Intent(primary_str)
+
+        secondary = None
+        if secondary_list:
+            sec_str = secondary_list[0].strip().lower()
+            if sec_str in _VALID_INTENTS and sec_str != primary_str:
+                secondary = Intent(sec_str)
+
+        logger.info(
+            f"[llm classifier] primary={primary.value} secondary={secondary} "
+            f"confidence={confidence:.2f} reasoning={data.get('reasoning', '')[:60]}"
+        )
+        return primary, secondary, confidence
+
+    except Exception as e:
+        logger.warning(f"[llm classifier] failed ({e}), falling back to rule-based")
+        primary, secondary = intent_router.classify_multi(message, has_attachment)
+        return primary, secondary, 0.5

@@ -1,13 +1,16 @@
 """
-Chat endpoint — the primary API surface.
+Chat endpoint — v0.3
 
-POST /api/chat  — multipart form with message + optional file
-Streams response as Server-Sent Events (SSE).
+POST /api/chat — multipart/form-data with message + optional file.
+Streams SSE. Interleaves observability events between text chunks.
 
-SSE format:
-    data: {"text": "token", "done": false}\n\n
-    data: {"text": "", "done": true}\n\n
-    data: {"error": "...", "done": true}\n\n
+SSE payload types emitted in order:
+    {"obs_event": {"type": "intent_classified", "data": {...}}}
+    {"intent": "web_search", "confidence": 0.92}   ← convenience extract
+    {"text": "Hello", "done": false}
+    ...
+    {"text": "", "done": true}
+    {"obs_event": {"type": "turn_complete", "data": {...}}}
 """
 from __future__ import annotations
 import json
@@ -19,19 +22,30 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 
 from core.engine import Engine
+from core.obs import ObsCollector
 from core.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# One engine instance per worker (stateless except for DB connection)
 _engine = Engine()
-
 MAX_FILE_BYTES = settings.localmind_max_file_size_mb * 1024 * 1024
 
 
-async def _event_stream(message: str, session_id: str, file_bytes=None, filename=None, content_type=None):
-    """Async generator that yields SSE-formatted chunks."""
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _event_stream(
+    message: str,
+    session_id: str,
+    file_bytes=None,
+    filename=None,
+    content_type=None,
+):
+    obs = ObsCollector()
+    intent_emitted = False
+
     try:
         async for chunk in _engine.process(
             message=message,
@@ -39,17 +53,31 @@ async def _event_stream(message: str, session_id: str, file_bytes=None, filename
             file=file_bytes,
             filename=filename,
             content_type=content_type,
+            obs=obs,
         ):
+            # Flush any buffered obs events before each text chunk
+            for evt in obs.drain():
+                yield _sse(evt.to_sse_dict())
+                # Convenience: extract intent + confidence once
+                if evt.type == "intent_classified" and not intent_emitted:
+                    intent_emitted = True
+                    yield _sse({
+                        "intent": evt.data.get("primary"),
+                        "confidence": float(evt.data.get("confidence", 0.5)),
+                    })
+
             if chunk.error:
-                payload = json.dumps({"error": chunk.error, "done": True})
-                yield f"data: {payload}\n\n"
+                yield _sse({"error": chunk.error, "done": True})
                 return
-            payload = json.dumps({"text": chunk.text, "done": chunk.done})
-            yield f"data: {payload}\n\n"
+            yield _sse({"text": chunk.text, "done": chunk.done})
+
+        # Final obs flush (turn_complete lands here)
+        for evt in obs.drain():
+            yield _sse(evt.to_sse_dict())
+
     except Exception as e:
         logger.error(f"Stream error: {e}", exc_info=True)
-        payload = json.dumps({"error": str(e), "done": True})
-        yield f"data: {payload}\n\n"
+        yield _sse({"error": str(e), "done": True})
 
 
 @router.post("/chat")
@@ -58,13 +86,7 @@ async def chat(
     session_id: str = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
 ):
-    """
-    Send a message and optionally attach a file. Returns an SSE stream.
-
-    - **message**: User's text message
-    - **session_id**: Conversation session identifier (auto-generated if omitted)
-    - **file**: Optional file attachment (PDF, DOCX, TXT, CSV, code files)
-    """
+    """Stream a chat response as Server-Sent Events."""
     sid = session_id or str(uuid.uuid4())
 
     file_bytes = None
@@ -76,7 +98,7 @@ async def chat(
         if len(file_bytes) > MAX_FILE_BYTES:
             raise HTTPException(
                 status_code=413,
-                detail=f"File too large. Maximum is {settings.localmind_max_file_size_mb} MB.",
+                detail=f"File too large. Maximum {settings.localmind_max_file_size_mb} MB.",
             )
         filename = file.filename
         file_content_type = file.content_type or "application/octet-stream"
@@ -86,6 +108,7 @@ async def chat(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
             "X-Session-ID": sid,
         },
     )

@@ -164,3 +164,20 @@ class VectorStore:
             return [{"fact": d, **m} for d, m in zip(docs, metas)]
         except Exception:
             return []
+
+    async def update_metadata(self, fact: str, updates: dict) -> bool:
+        """Update metadata fields for an existing fact."""
+        client = self._get_client()
+        if not client or not self._collection:
+            return False
+        try:
+            fact_id = self._fact_id(fact)
+            # Get current metadata
+            result = self._collection.get(ids=[fact_id], include=["metadatas"])
+            existing_meta = result.get("metadatas", [{}])[0] if result.get("metadatas") else {}
+            merged = {**existing_meta, **updates}
+            self._collection.update(ids=[fact_id], metadatas=[merged])
+            return True
+        except Exception as e:
+            logger.debug(f"Metadata update failed (non-critical): {e}")
+            return False

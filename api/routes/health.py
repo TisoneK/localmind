@@ -1,10 +1,10 @@
-"""Health check endpoint — used by CLI and UI to verify readiness."""
+"""Health check endpoint."""
 from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 from adapters import get_adapter
 from core.config import settings
-from tools import list_tools
+from tools import available_tools
 
 router = APIRouter()
 
@@ -15,6 +15,7 @@ class HealthResponse(BaseModel):
     model: str
     adapter: str
     tools: list[dict]
+    version: str = "0.3.0-dev"
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -26,5 +27,5 @@ async def health():
         ollama_reachable=reachable,
         model=settings.ollama_model,
         adapter=settings.localmind_adapter,
-        tools=list_tools(),
+        tools=available_tools(),
     )
