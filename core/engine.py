@@ -28,7 +28,7 @@ from core.memory import MemoryComposer
 from core.agent import AgentLoop, AGENT_INTENTS
 from storage.db import SessionStore
 from adapters import get_adapter
-from tools import dispatch, available_tools
+from tools import dispatch, list_tools
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class Engine:
                 messages=prompt_messages,
                 intent=primary_intent,
                 initial_tool_result=tool_result,
-                available_tools=available_tools(),
+                available_tools=list_tools(),
             ):
                 full_response.append(chunk.text)
                 yield chunk

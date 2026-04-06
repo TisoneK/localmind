@@ -29,7 +29,7 @@ async def dispatch(intent: Intent, message: str) -> ToolResult | None:
     return await entry["fn"](message)
 
 
-def available_tools() -> list[dict]:
+def list_tools() -> list[dict]:
     """Return metadata for all registered tools (for model router / tool scoring)."""
     return [
         {
