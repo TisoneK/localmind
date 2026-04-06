@@ -61,7 +61,13 @@ class VectorStore:
         source: str = "user",
         extra_metadata: Optional[dict] = None,
     ) -> bool:
-        """Store a fact with optional extra metadata."""
+        """Store a fact with optional extra metadata.
+
+        A5: Before inserting, checks cosine similarity against existing facts.
+        If any existing fact has distance < 0.15 (near-duplicate), we upsert
+        onto that existing ID instead of creating a new entry. This prevents
+        the same preference being stored multiple times.
+        """
         client = self._get_client()
         if not client or not self._collection:
             return False
@@ -75,10 +81,30 @@ class VectorStore:
             if extra_metadata:
                 metadata.update(extra_metadata)
 
+            # A5: Deduplication — check for near-identical existing facts
+            target_id = self._fact_id(fact)
+            try:
+                existing = self._collection.get()
+                if existing.get("ids"):
+                    dupes = self._collection.query(
+                        query_texts=[fact],
+                        n_results=min(3, len(existing["ids"])),
+                        include=["distances"],
+                    )
+                    distances = dupes.get("distances", [[]])[0]
+                    ids = dupes.get("ids", [[]])[0]
+                    for dist, eid in zip(distances, ids):
+                        if dist < 0.15:  # near-duplicate threshold
+                            target_id = eid  # upsert onto existing fact's ID
+                            logger.debug(f"[memory] dedup: dist={dist:.3f}, reusing id={eid[:8]}")
+                            break
+            except Exception:
+                pass  # dedup check failed non-critically; proceed with normal store
+
             self._collection.upsert(
                 documents=[fact],
                 metadatas=[metadata],
-                ids=[self._fact_id(fact)],
+                ids=[target_id],
             )
             return True
         except Exception as e:
@@ -130,7 +156,7 @@ class VectorStore:
             return []
 
     async def forget(self, fact: str) -> bool:
-        """Delete a specific fact."""
+        """Delete a specific fact by content."""
         client = self._get_client()
         if not client or not self._collection:
             return False
@@ -139,6 +165,18 @@ class VectorStore:
             return True
         except Exception as e:
             logger.error(f"Vector delete failed: {e}")
+            return False
+
+    async def forget_by_id(self, fact_id: str) -> bool:
+        """Delete a specific fact by its ID (F4: memory viewer delete button)."""
+        client = self._get_client()
+        if not client or not self._collection:
+            return False
+        try:
+            self._collection.delete(ids=[fact_id])
+            return True
+        except Exception as e:
+            logger.error(f"Vector delete_by_id failed: {e}")
             return False
 
     async def list_all(self) -> list[str]:
@@ -153,7 +191,7 @@ class VectorStore:
             return []
 
     async def list_all_with_metadata(self) -> list[dict]:
-        """Return all facts with metadata."""
+        """Return all facts with metadata including their IDs (F4: memory viewer)."""
         client = self._get_client()
         if not client or not self._collection:
             return []
@@ -161,7 +199,8 @@ class VectorStore:
             results = self._collection.get(include=["documents", "metadatas"])
             docs = results.get("documents") or []
             metas = results.get("metadatas") or []
-            return [{"fact": d, **m} for d, m in zip(docs, metas)]
+            ids = results.get("ids") or []
+            return [{"id": i, "fact": d, **m} for i, d, m in zip(ids, docs, metas)]
         except Exception:
             return []
 

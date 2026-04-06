@@ -15,7 +15,7 @@ class HealthResponse(BaseModel):
     model: str
     adapter: str
     tools: list[dict]
-    version: str = "0.3.0-dev"
+    version: str = "0.4.0-dev"
 
 
 @router.get("/health", response_model=HealthResponse)

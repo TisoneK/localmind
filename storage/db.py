@@ -39,6 +39,14 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, timestamp);
+
+-- A4: Dynamic reliability tracking for tool scorer
+CREATE TABLE IF NOT EXISTS tool_stats (
+    tool_name       TEXT    PRIMARY KEY,
+    success_count   INTEGER NOT NULL DEFAULT 0,
+    failure_count   INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -142,3 +150,38 @@ class SessionStore:
         with self._conn() as conn:
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM sessions")
+
+    # ── A4: Tool reliability tracking ─────────────────────────────────────
+
+    def record_tool_result(self, tool_name: str, success: bool, latency_ms: int = 0) -> None:
+        """Record a tool success or failure to update dynamic reliability scores."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_stats(tool_name, success_count, failure_count, total_latency_ms)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(tool_name) DO UPDATE SET
+                    success_count    = success_count    + excluded.success_count,
+                    failure_count    = failure_count    + excluded.failure_count,
+                    total_latency_ms = total_latency_ms + excluded.total_latency_ms
+                """,
+                (
+                    tool_name,
+                    1 if success else 0,
+                    0 if success else 1,
+                    max(0, latency_ms),
+                ),
+            )
+
+    def get_reliability(self) -> dict[str, float]:
+        """Return reliability score (0–1) per tool based on recorded outcomes."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT tool_name, success_count, failure_count FROM tool_stats"
+            ).fetchall()
+        result = {}
+        for row in rows:
+            total = row["success_count"] + row["failure_count"]
+            if total >= 5:  # only trust stats after enough samples
+                result[row["tool_name"]] = row["success_count"] / total
+        return result

@@ -19,7 +19,7 @@ SNIPPET_MAX = 300
 
 async def _search_ddg(query: str) -> list[dict]:
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=MAX_RESULTS))
         return results
@@ -58,6 +58,10 @@ def _format_results(results: list[dict]) -> str:
         body = r.get("body", r.get("description", "")).strip()
         if len(body) > SNIPPET_MAX:
             body = body[:SNIPPET_MAX] + "…"
+        # Ensure proper Unicode handling
+        title = title.encode('utf-8', errors='ignore').decode('utf-8')
+        url = url.encode('utf-8', errors='ignore').decode('utf-8')
+        body = body.encode('utf-8', errors='ignore').decode('utf-8')
         lines.append(f"{i}. **{title}**\n   {url}\n   {body}")
     return "\n\n".join(lines)
 

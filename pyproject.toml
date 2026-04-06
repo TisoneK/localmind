@@ -40,7 +40,7 @@ dependencies = [
     "openpyxl>=3.1.0",          # Excel support for pandas
 
     # Web search
-    "duckduckgo-search>=6.1.0",
+    "ddgs>=6.1.0",
 
     # Memory / Storage
     "chromadb>=0.5.0",

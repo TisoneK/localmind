@@ -26,10 +26,11 @@ from core.models import (
 )
 from core.config import settings
 from core import context_builder
+from core.summarizer import maybe_compress_history
 from core.intent_classifier import classify_with_llm
 from core.memory import MemoryComposer
 from core.agent import AgentLoop, AGENT_INTENTS
-from core.tool_scorer import best_tool, score_tools
+from core.tool_scorer import best_tool, score_tools, load_reliability_from_db, record_tool_outcome
 from core.obs import ObsCollector
 from storage.db import SessionStore
 from adapters import get_adapter
@@ -44,6 +45,11 @@ class Engine:
         self._adapter = get_adapter(settings.localmind_adapter)
         self._memory = MemoryComposer()
         self._agent_loop = AgentLoop(adapter=self._adapter)
+        # A4: Bootstrap tool reliability from historical DB stats
+        try:
+            load_reliability_from_db(self._store.get_reliability())
+        except Exception as e:
+            logger.debug(f"[engine] reliability bootstrap skipped: {e}")
 
     async def process(
         self,
@@ -122,9 +128,15 @@ class Engine:
                           tool=effective_intent.value,
                           success=tool_result is not None,
                           latency_ms=round((time.monotonic() - t_tool) * 1000))
+                # A4: record success
+                record_tool_outcome(self._store, effective_intent.value, success=True,
+                                    latency_ms=round((time.monotonic() - t_tool) * 1000))
             except Exception as e:
                 logger.warning(f"Tool dispatch failed for {effective_intent}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])
+                # A4: record failure
+                record_tool_outcome(self._store, effective_intent.value, success=False,
+                                    latency_ms=round((time.monotonic() - t_tool) * 1000))
 
         # ── 7. Build context ───────────────────────────────────────────────
         ctx = EngineContext(
@@ -137,6 +149,11 @@ class Engine:
             memory_facts=memory_facts,
         )
         prompt_messages = context_builder.build(ctx, self._adapter.context_window)
+
+        # A2: Compress history if approaching context window limit
+        prompt_messages = await maybe_compress_history(
+            prompt_messages, self._adapter, self._adapter.context_window
+        )
 
         # ── 7a/7b. Stream response ─────────────────────────────────────────
         full_response = []

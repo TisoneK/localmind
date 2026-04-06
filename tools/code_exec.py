@@ -122,4 +122,5 @@ register_tool(
     description="Execute Python code snippets and return stdout/stderr output",
     cost=0.02,
     latency_ms=2000,
+    parallelizable=False,  # A3: stateful subprocess — must run sequentially
 )

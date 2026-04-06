@@ -19,7 +19,7 @@ from tools import dispatch
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 6
+MAX_ITERATIONS = 12
 
 AGENT_INTENTS = {
     Intent.WEB_SEARCH,
@@ -127,8 +127,7 @@ class AgentLoop:
                 f"Could you confirm, or rephrase what you'd like me to do?"
             )
             trace.clarification_issued = True
-            for char in clarification:
-                yield StreamChunk(text=char, done=False)
+            yield StreamChunk(text=clarification, done=False)  # B6: yield as single chunk
             yield StreamChunk(text="", done=True)
             return
 
@@ -187,8 +186,7 @@ class AgentLoop:
                     tool_name=None, tool_input=None, observation=None,
                     reflection="clarification issued",
                 ))
-                for char in question:
-                    yield StreamChunk(text=char, done=False)
+                yield StreamChunk(text=question, done=False)  # B6: single chunk
                 yield StreamChunk(text="", done=True)
                 return
 
@@ -201,8 +199,7 @@ class AgentLoop:
                     iteration=iteration + 1, thought=thought,
                     tool_name=None, tool_input=None, observation=None,
                 ))
-                for char in final_response:
-                    yield StreamChunk(text=char, done=False)
+                yield StreamChunk(text=final_response, done=False)  # B6: single chunk
                 yield StreamChunk(text="", done=True)
                 logger.info(f"[agent] finished at iteration {iteration+1}")
                 return
@@ -263,8 +260,7 @@ class AgentLoop:
 
             # No structured tag found — treat as finish
             logger.warning(f"[agent] no tag at iteration {iteration+1}, treating as finish")
-            for char in thought:
-                yield StreamChunk(text=char, done=False)
+            yield StreamChunk(text=thought, done=False)  # B6: single chunk
             yield StreamChunk(text="", done=True)
             return
 

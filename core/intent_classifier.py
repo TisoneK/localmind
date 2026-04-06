@@ -1,9 +1,15 @@
 """
-LLM Intent Classifier — v0.3 replacement for rule-based pattern matching.
+LLM Intent Classifier — v0.4
 
-Uses a lightweight model call with structured JSON output to classify intent
-with confidence scores. Falls back to rule-based classify_multi() on failure
-so the system always produces an answer.
+Performance-first strategy:
+  1. Run the fast rule-based classifier (intent_router) first.
+  2. If the rule-based result is high-confidence (>= 0.80), return it immediately —
+     no LLM call, no latency. This covers the vast majority of unambiguous messages
+     like "What is the time?" (chat), "search for X" (web_search), etc.
+  3. Only fall back to an LLM call for genuinely ambiguous messages where the
+     rule-based router returns CHAT as a catch-all (low implicit confidence).
+  4. The LLM classify call uses ollama_model_fast when configured, so it runs on
+     a smaller model (e.g. phi3:mini) and completes much faster.
 
 Output schema:
     {
@@ -25,6 +31,19 @@ from core import intent_router
 logger = logging.getLogger(__name__)
 
 _VALID_INTENTS = {i.value for i in Intent}
+
+# Minimum rule-based confidence to skip the LLM call entirely
+_RULE_CONFIDENCE_THRESHOLD = 0.80
+
+# Rule-based confidence heuristic: non-CHAT matches are strong signals
+_RULE_CONFIDENCE_BY_INTENT: dict[str, float] = {
+    Intent.WEB_SEARCH.value:  0.88,
+    Intent.CODE_EXEC.value:   0.92,
+    Intent.MEMORY_OP.value:   0.90,
+    Intent.FILE_TASK.value:   0.90,
+    Intent.FILE_WRITE.value:  0.88,
+    Intent.CHAT.value:        0.60,   # CHAT is the catch-all — ambiguous by definition
+}
 
 _CLASSIFIER_SYSTEM = """You are an intent classifier for a local AI assistant.
 
@@ -52,9 +71,35 @@ async def classify_with_llm(
     adapter,
 ) -> tuple[Intent, Optional[Intent], float]:
     """
-    Classify intent using the LLM. Returns (primary, secondary, confidence).
-    Falls back to rule-based on any failure.
+    Classify intent.  Rule-based first; LLM only when ambiguous.
+
+    Returns (primary, secondary, confidence).
     """
+    # ── Step 1: Fast rule-based classification ────────────────────────────
+    rule_primary, rule_secondary = intent_router.classify_multi(message, has_attachment)
+    rule_confidence = _RULE_CONFIDENCE_BY_INTENT.get(rule_primary.value, 0.70)
+
+    if rule_confidence >= _RULE_CONFIDENCE_THRESHOLD:
+        # High confidence — skip LLM entirely, return immediately
+        logger.debug(
+            f"[classifier] rule-based shortcut: {rule_primary.value} "
+            f"conf={rule_confidence:.2f} (skipped LLM)"
+        )
+        return rule_primary, rule_secondary, rule_confidence
+
+    # ── Step 2: LLM classification for ambiguous cases ────────────────────
+    # Use fast model if configured; fall back to main model
+    from core.config import settings
+    fast_model = getattr(settings, "ollama_model_fast", "")
+    classify_adapter = adapter
+
+    if fast_model and fast_model != settings.ollama_model:
+        try:
+            from adapters import get_adapter
+            classify_adapter = get_adapter(settings.localmind_adapter, model_override=fast_model)
+        except Exception:
+            classify_adapter = adapter  # fall back silently
+
     user_content = f"has_file={str(has_attachment).lower()}\nmessage: {message}"
     messages = [
         {"role": "system", "content": _CLASSIFIER_SYSTEM},
@@ -63,12 +108,10 @@ async def classify_with_llm(
 
     try:
         chunks = []
-        async for chunk in adapter.chat(messages, temperature=0.0):
+        async for chunk in classify_adapter.chat(messages, temperature=0.0):
             chunks.append(chunk.text)
 
         raw = "".join(chunks).strip()
-
-        # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\s*```$", "", raw)
 
@@ -82,7 +125,6 @@ async def classify_with_llm(
             raise ValueError(f"Unknown intent: {primary_str!r}")
 
         primary = Intent(primary_str)
-
         secondary = None
         if secondary_list:
             sec_str = secondary_list[0].strip().lower()
@@ -96,6 +138,5 @@ async def classify_with_llm(
         return primary, secondary, confidence
 
     except Exception as e:
-        logger.warning(f"[llm classifier] failed ({e}), falling back to rule-based")
-        primary, secondary = intent_router.classify_multi(message, has_attachment)
-        return primary, secondary, 0.5
+        logger.warning(f"[llm classifier] failed ({e}), using rule-based fallback")
+        return rule_primary, rule_secondary, rule_confidence

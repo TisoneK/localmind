@@ -24,10 +24,14 @@ def _get_encoder():
         try:
             _ENCODER = tiktoken.get_encoding("cl100k_base")
         except Exception:
-            # Fallback: rough token estimate (1 token ≈ 4 chars) when tiktoken unavailable
+            # B5: UTF-8 byte length is a better fallback than char count.
+            # Non-Latin scripts (CJK, Arabic) use 3-4 bytes/char so char-based
+            # counting underestimates; code is mostly ASCII so both are similar.
+            # Documented limitation: still imprecise; long-term fix is to bundle
+            # a minimal BPE vocab or use the Ollama token-count endpoint.
             class _FallbackEncoder:
                 def encode(self, text: str) -> list:
-                    return list(range(len(text) // 4))
+                    return list(range(len(text.encode("utf-8")) // 4))
             _ENCODER = _FallbackEncoder()
     return _ENCODER
 

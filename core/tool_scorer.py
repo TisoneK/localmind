@@ -15,8 +15,8 @@ from core.models import Intent
 
 logger = logging.getLogger(__name__)
 
-# Known reliability scores per tool (0.0–1.0, based on failure rate in practice)
-# These will be updated dynamically in v0.4 via a feedback loop.
+# Known reliability scores per tool (0.0–1.0)
+# Seeded with reasonable defaults; overridden at startup by DB stats (A4).
 _RELIABILITY: dict[str, float] = {
     "web_search": 0.85,
     "code_exec":  0.90,
@@ -25,6 +25,35 @@ _RELIABILITY: dict[str, float] = {
     "memory_op":  0.99,
     "chat":       1.00,
 }
+
+
+def load_reliability_from_db(db_reliability: dict[str, float]) -> None:
+    """A4: Overwrite _RELIABILITY with DB-derived scores where sample size is sufficient.
+
+    Call once at engine startup. Scores with insufficient samples fall back to defaults.
+    """
+    for tool_name, score in db_reliability.items():
+        _RELIABILITY[tool_name] = round(score, 4)
+        logger.debug(f"[tool scorer] loaded reliability {tool_name}={score:.3f} from DB")
+
+
+def record_tool_outcome(store, tool_name: str, success: bool, latency_ms: int = 0) -> None:
+    """A4: Persist tool outcome to DB and update in-memory reliability score.
+
+    Args:
+        store: SessionStore instance with record_tool_result().
+        tool_name: Tool intent string (e.g. 'web_search').
+        success: Whether the tool call succeeded.
+        latency_ms: Measured latency for this call.
+    """
+    try:
+        store.record_tool_result(tool_name, success, latency_ms)
+        # Re-read updated reliability for this tool only
+        updated = store.get_reliability()
+        if tool_name in updated:
+            _RELIABILITY[tool_name] = round(updated[tool_name], 4)
+    except Exception as e:
+        logger.debug(f"[tool scorer] reliability update skipped: {e}")
 
 # Normalization ranges for latency (ms) and cost
 _MAX_LATENCY_MS = 5000.0

@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from core.config import settings
-from api.routes import chat, sessions, health, models
+from api.routes import chat, sessions, health, models, ollama, memory
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="LocalMind",
         description="Local AI runtime — file reading, web search, memory, tool use",
-        version="0.3.0-dev",
+        version="0.4.0-dev",
         docs_url="/api/docs",
         redoc_url=None,
     )
@@ -40,6 +40,8 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health.router, prefix="/api", tags=["health"])
+    app.include_router(ollama.router, prefix="/api", tags=["ollama"])
+    app.include_router(memory.router, prefix="/api", tags=["memory"])
     app.include_router(models.router, prefix="/api", tags=["models"])
     app.include_router(sessions.router, prefix="/api", tags=["sessions"])
     app.include_router(chat.router, prefix="/api", tags=["chat"])

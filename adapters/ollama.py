@@ -37,9 +37,9 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 
 
 class OllamaAdapter(BaseAdapter):
-    def __init__(self):
+    def __init__(self, model_override: str = ""):
         self._base_url = settings.ollama_base_url.rstrip("/")
-        self._model = settings.ollama_model
+        self._model = model_override if model_override else settings.ollama_model
         self._timeout = settings.ollama_timeout
         self._client = httpx.AsyncClient(timeout=self._timeout)
 

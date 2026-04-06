@@ -58,6 +58,7 @@ chroma_db/
 *.db
 uploads/
 temp/
+localmind_output/
 
 # Node / UI
 node_modules/
