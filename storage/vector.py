@@ -1,13 +1,16 @@
 """
 Vector Store — ChromaDB-backed semantic memory.
 
-Used for cross-session fact storage (v0.3).
-Scaffolded in v0.1 so the interface is stable and importable.
+Upgraded in v0.2:
+- recall_with_scores() returns (fact, distance, metadata) triples
+- store() accepts extra_metadata for memory_type tagging
+- session-scoped recall for episodic queries
+- list_all() returns facts with metadata
 
 Collection schema:
     collection: "localmind_memory"
     documents: fact strings
-    metadatas: {session_id, timestamp, source}
+    metadatas: {session_id, timestamp, source, memory_type}
     ids: sha256(fact)[:16]
 """
 from __future__ import annotations
@@ -43,26 +46,39 @@ class VectorStore:
             except ImportError:
                 logger.warning("chromadb not installed. Memory persistence disabled.")
                 return None
+            except Exception as e:
+                logger.error(f"ChromaDB init failed: {e}")
+                return None
         return self._client
 
     def _fact_id(self, fact: str) -> str:
         return hashlib.sha256(fact.encode()).hexdigest()[:16]
 
-    async def store(self, fact: str, session_id: str, source: str = "user") -> bool:
-        """Store a fact in the vector store."""
+    async def store(
+        self,
+        fact: str,
+        session_id: str,
+        source: str = "user",
+        extra_metadata: Optional[dict] = None,
+    ) -> bool:
+        """Store a fact with optional extra metadata."""
         client = self._get_client()
         if not client or not self._collection:
             return False
         try:
-            fact_id = self._fact_id(fact)
+            metadata = {
+                "session_id": session_id,
+                "timestamp": str(time.time()),
+                "source": source,
+                "memory_type": "semantic",
+            }
+            if extra_metadata:
+                metadata.update(extra_metadata)
+
             self._collection.upsert(
                 documents=[fact],
-                metadatas=[{
-                    "session_id": session_id,
-                    "timestamp": str(time.time()),
-                    "source": source,
-                }],
-                ids=[fact_id],
+                metadatas=[metadata],
+                ids=[self._fact_id(fact)],
             )
             return True
         except Exception as e:
@@ -70,7 +86,23 @@ class VectorStore:
             return False
 
     async def recall(self, query: str, top_k: int = 5) -> list[str]:
-        """Retrieve semantically relevant facts for a query."""
+        """Retrieve semantically relevant facts (documents only)."""
+        results = await self.recall_with_scores(query=query, top_k=top_k)
+        return [fact for fact, _, _ in results]
+
+    async def recall_with_scores(
+        self,
+        query: str,
+        top_k: int = 10,
+        session_id: Optional[str] = None,
+    ) -> list[tuple[str, float, dict]]:
+        """
+        Retrieve facts with cosine distances and metadata.
+
+        Returns:
+            List of (fact, distance, metadata) tuples sorted by distance ascending.
+            distance=0.0 is identical, distance=1.0 is orthogonal.
+        """
         client = self._get_client()
         if not client or not self._collection:
             return []
@@ -78,13 +110,23 @@ class VectorStore:
             count = self._collection.count()
             if count == 0:
                 return []
-            results = self._collection.query(
+
+            where = {"session_id": session_id} if session_id else None
+            query_kwargs = dict(
                 query_texts=[query],
                 n_results=min(top_k, count),
+                include=["documents", "distances", "metadatas"],
             )
-            return results["documents"][0] if results["documents"] else []
+            if where:
+                query_kwargs["where"] = where
+
+            results = self._collection.query(**query_kwargs)
+            docs = results.get("documents", [[]])[0]
+            distances = results.get("distances", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            return list(zip(docs, distances, metadatas))
         except Exception as e:
-            logger.error(f"Vector recall failed: {e}")
+            logger.error(f"Vector recall_with_scores failed: {e}")
             return []
 
     async def forget(self, fact: str) -> bool:
@@ -100,12 +142,25 @@ class VectorStore:
             return False
 
     async def list_all(self) -> list[str]:
-        """Return all stored facts (for memory viewer UI)."""
+        """Return all stored facts."""
         client = self._get_client()
         if not client or not self._collection:
             return []
         try:
             results = self._collection.get()
-            return results["documents"] or []
+            return results.get("documents") or []
+        except Exception:
+            return []
+
+    async def list_all_with_metadata(self) -> list[dict]:
+        """Return all facts with metadata."""
+        client = self._get_client()
+        if not client or not self._collection:
+            return []
+        try:
+            results = self._collection.get(include=["documents", "metadatas"])
+            docs = results.get("documents") or []
+            metas = results.get("metadatas") or []
+            return [{"fact": d, **m} for d, m in zip(docs, metas)]
         except Exception:
             return []

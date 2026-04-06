@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     localmind_response_reserve_tokens: int = 2048
     localmind_history_max_tokens: int = 4096
 
+    # Model routing — optional fast/code-specialized models
+    # If not set, falls back to ollama_model for all requests
+    ollama_model_fast: str = ""   # e.g. "phi3:mini" for short CHAT turns
+    ollama_model_code: str = ""   # e.g. "qwen2.5-coder:7b" for CODE_EXEC
+
+    # Agent loop
+    localmind_agent_enabled: bool = True
+    localmind_agent_max_iterations: int = 6
+
 
 # Singleton — import this everywhere
 settings = Settings()

@@ -1,107 +1,60 @@
 """
-File Writer Tool — creates and edits files on disk.
+File Writer tool — creates files from model responses or tool results.
 
-Security model (enforced here, not in the UI):
-- Every write or delete MUST have requires_confirmation=True
-- The engine will not execute writes without explicit user approval
-- Paths are validated to prevent traversal attacks
-- Absolute paths only — no relative path tricks
-
-v0.5 milestone. This module is fully scaffolded so the interface is stable,
-but the engine will gate on requires_confirmation before calling execute().
+Handles FILE_WRITE intent. Writes content to the user's local filesystem
+using a safe path within the configured output directory.
 """
 from __future__ import annotations
 import logging
-import os
+import re
+import time
 from pathlib import Path
 
-from core.models import RiskLevel
-from tools.base import ToolResult
+from core.models import ToolResult, RiskLevel
 
 logger = logging.getLogger(__name__)
 
-# Paths that can never be written to
-_PROTECTED_PATHS = {
-    "/etc", "/sys", "/proc", "/boot", "/bin", "/sbin", "/usr/bin",
-    "C:\\Windows", "C:\\System32",
-}
+OUTPUT_DIR = Path("./localmind_output")
 
 
-def _is_safe_path(path: str) -> bool:
-    resolved = str(Path(path).resolve())
-    for protected in _PROTECTED_PATHS:
-        if resolved.startswith(protected):
-            return False
-    return True
-
-
-async def run(input_data: dict, context: dict) -> ToolResult:
-    """
-    File write tool entry point. Always returns requires_confirmation=True.
-    Actual write is performed by execute() after user confirms.
-    """
-    path = input_data.get("path", "")
-    content = input_data.get("content", "")
-
-    if not path:
-        return ToolResult(
-            content="No file path specified.",
-            risk=RiskLevel.HIGH,
-            source="file_writer",
-        )
-
-    if not _is_safe_path(path):
-        return ToolResult(
-            content=f"Cannot write to protected path: {path}",
-            risk=RiskLevel.HIGH,
-            source="file_writer",
-        )
-
-    return ToolResult(
-        content=f"Ready to write {len(content)} characters to: {path}\n\nConfirm to proceed.",
-        risk=RiskLevel.HIGH,
-        source="file_writer",
-        requires_confirmation=True,
-        metadata={"path": path, "size_bytes": len(content.encode())},
+def _infer_filename(message: str) -> str:
+    """Extract a filename from the user's request, or generate a timestamped one."""
+    # Try to extract explicit filename
+    match = re.search(
+        r"\b([\w\-]+\.(py|js|ts|txt|md|csv|json|html|sh|yaml|yml))\b",
+        message,
+        re.IGNORECASE,
     )
+    if match:
+        return match.group(1)
+    # Generate a timestamped name
+    ts = int(time.time())
+    return f"localmind_output_{ts}.txt"
 
 
-async def execute(path: str, content: str, mode: str = "write") -> ToolResult:
+async def write_response(message: str, content: str) -> ToolResult:
     """
-    Execute a confirmed file write.
+    Write content to a local file.
 
-    Args:
-        path: Absolute or relative path to write.
-        content: File content.
-        mode: 'write' (overwrite) or 'append'.
-
-    Returns:
-        ToolResult confirming the write.
+    Returns a ToolResult indicating success or failure.
     """
-    if not _is_safe_path(path):
-        return ToolResult(
-            content=f"Blocked: cannot write to protected path: {path}",
-            risk=RiskLevel.HIGH,
-            source="file_writer",
-        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _infer_filename(message)
+    filepath = OUTPUT_DIR / filename
 
     try:
-        resolved = Path(path).resolve()
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        file_mode = "a" if mode == "append" else "w"
-        with open(resolved, file_mode, encoding="utf-8") as f:
-            f.write(content)
-        logger.info(f"File written: {resolved} ({len(content)} chars)")
+        filepath.write_text(content, encoding="utf-8")
+        logger.info(f"[file_writer] wrote {len(content)} chars to {filepath}")
         return ToolResult(
-            content=f"File written successfully: {resolved}",
-            risk=RiskLevel.HIGH,
+            content=f"File written successfully: {filepath}",
+            risk=RiskLevel.LOW,
             source="file_writer",
-            metadata={"path": str(resolved), "mode": mode},
+            metadata={"path": str(filepath), "bytes": len(content.encode())},
         )
     except Exception as e:
-        logger.error(f"File write failed: {e}")
+        logger.error(f"[file_writer] failed: {e}")
         return ToolResult(
-            content=f"File write failed: {e}",
-            risk=RiskLevel.HIGH,
+            content=f"Failed to write file: {e}",
+            risk=RiskLevel.MEDIUM,
             source="file_writer",
         )

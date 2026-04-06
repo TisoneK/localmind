@@ -1,88 +1,42 @@
 """
-Tool registry and dispatcher.
+Tool registry and dispatch layer.
 
-Each tool declares:
-- run: async callable
-- description: plain English what it does
-- risk: LOW / MEDIUM / HIGH
-- intents: which Intent values trigger this tool
-
-The dispatcher is called by the engine with an Intent and the raw message.
+Tools are registered with metadata (description, cost, latency) so the engine
+can score and select them intelligently rather than routing by hard-coded intent.
 """
 from __future__ import annotations
-from core.models import Intent, RiskLevel, ToolResult
-from tools.base import ToolResult
+from core.models import Intent, ToolResult
 
-# Lazy imports — tools only loaded when dispatched
-_REGISTRY: dict[str, dict] = {
-    Intent.FILE_TASK: {
-        "module": "tools.file_reader",
-        "description": "Read and parse uploaded files",
-        "risk": RiskLevel.LOW,
-    },
-    Intent.WEB_SEARCH: {
-        "module": "tools.web_search",
-        "description": "Search the web for current information",
-        "risk": RiskLevel.LOW,
-    },
-    Intent.CODE_EXEC: {
-        "module": "tools.code_executor",
-        "description": "Execute Python or JavaScript code in a sandbox",
-        "risk": RiskLevel.MEDIUM,
-    },
-    Intent.MEMORY_OP: {
-        "module": "tools.memory",
-        "description": "Store and recall facts across sessions",
-        "risk": RiskLevel.LOW,
-    },
-    Intent.FILE_WRITE: {
-        "module": "tools.file_writer",
-        "description": "Create or edit files on disk (requires confirmation)",
-        "risk": RiskLevel.HIGH,
-    },
-}
+# Registry populated by register_tool()
+_REGISTRY: dict[Intent, dict] = {}
 
 
-async def dispatch(intent: Intent, message: str, context: dict = None) -> ToolResult:
-    """
-    Dispatch to the correct tool for the given intent.
+def register_tool(intent: Intent, fn, *, description: str, cost: float = 0.1, latency_ms: int = 500):
+    """Register a callable as the handler for an intent, with metadata."""
+    _REGISTRY[intent] = {
+        "fn": fn,
+        "description": description,
+        "cost": cost,
+        "latency_ms": latency_ms,
+    }
 
-    Args:
-        intent: Classified intent from the intent router.
-        message: Raw user message (used as fallback query).
-        context: Optional extra context dict passed to the tool.
 
-    Returns:
-        ToolResult from the dispatched tool.
-    """
-    import importlib
-
-    context = context or {"message": message}
+async def dispatch(intent: Intent, message: str) -> ToolResult | None:
+    """Dispatch to the registered tool for an intent. Returns None if no tool registered."""
     entry = _REGISTRY.get(intent)
-
     if not entry:
-        return ToolResult(
-            content="",
-            risk=RiskLevel.LOW,
-            source="dispatch",
-        )
-
-    module = importlib.import_module(entry["module"])
-    result = await module.run(
-        input_data={"query": message, "message": message},
-        context=context,
-    )
-    return result
+        return None
+    return await entry["fn"](message)
 
 
-def list_tools() -> list[dict]:
-    """Return all registered tools with metadata. Used by CLI and health endpoint."""
+def available_tools() -> list[dict]:
+    """Return metadata for all registered tools (for model router / tool scoring)."""
     return [
         {
             "intent": intent.value,
             "description": meta["description"],
-            "risk": meta["risk"].value,
-            "module": meta["module"],
+            "cost": meta["cost"],
+            "latency_ms": meta["latency_ms"],
         }
         for intent, meta in _REGISTRY.items()
     ]
