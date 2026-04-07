@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from core.config import settings
-from api.routes import chat, sessions, health, models, ollama, memory
+from api.routes import chat, sessions, health, models, ollama, memory, filesystem
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,18 @@ def create_app() -> FastAPI:
     app.include_router(memory.router, prefix="/api", tags=["memory"])
     app.include_router(models.router, prefix="/api", tags=["models"])
     app.include_router(sessions.router, prefix="/api", tags=["sessions"])
+    app.include_router(filesystem.router, prefix="/api", tags=["filesystem"])
     app.include_router(chat.router, prefix="/api", tags=["chat"])
+
+    @app.get("/api/routing", tags=["models"])
+    async def model_routing():
+        """Show which model handles each intent — useful for debugging and UI display."""
+        from core.model_router import routing_report
+        return {
+            "main_model": settings.ollama_model,
+            "routing": routing_report(settings.ollama_model),
+            "note": "First pulled model from preference list wins per intent.",
+        }
 
     # Serve single-file UI — no build step required
     if UI_HTML.exists():
@@ -61,6 +72,16 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        logger.info(f"LocalMind v0.3 — model: {settings.ollama_model} | ui: {UI_HTML.exists()}")
+        logger.info(f"LocalMind — model: {settings.ollama_model} | ui: {UI_HTML.exists()}")
+        # Warm up model router with currently pulled models
+        try:
+            from adapters.ollama import OllamaAdapter
+            from core.model_router import update_pulled_models
+            adapter = OllamaAdapter()
+            pulled = await adapter.list_models()
+            update_pulled_models(pulled)
+            logger.info(f"[startup] model router ready — {len(pulled)} models available")
+        except Exception as e:
+            logger.warning(f"[startup] model router warm-up failed: {e}")
 
     return app

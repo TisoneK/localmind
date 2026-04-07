@@ -27,6 +27,11 @@ _MEMORY_RELEVANT_INTENTS = {
     Intent.FILE_WRITE,
 }
 
+# Don't bother embedding and searching for very short conversational messages.
+# These can't have meaningful memory matches and triggering ChromaDB here
+# causes the cold-start embedding load (10-30s) on simple greetings.
+_MIN_QUERY_WORDS_FOR_MEMORY = 5
+
 _RELEVANCE_THRESHOLD = 0.45
 _LOOSE_THRESHOLD = 0.60     # used when memory store is small (< 10 facts)
 _MAX_FACTS = 6
@@ -52,6 +57,13 @@ class MemoryComposer:
         top_k: int = _MAX_FACTS,
     ) -> list[str]:
         if intent not in _MEMORY_RELEVANT_INTENTS:
+            return []
+
+        # Skip embedding + vector search for short queries — ChromaDB cold-start
+        # is expensive (10-30s) and short messages have no meaningful matches.
+        # Always run for MEMORY_OP (explicit recall requests).
+        word_count = len(query.strip().split())
+        if intent != Intent.MEMORY_OP and word_count < _MIN_QUERY_WORDS_FOR_MEMORY:
             return []
 
         try:

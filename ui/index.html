@@ -363,18 +363,61 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* ── Thinking indicator ─────────────────────────────────── */
-  .thinking-row { display: flex; padding: 0 24px; margin-bottom: 20px; gap: 14px; }
-  .thinking-dots { display: flex; gap: 4px; align-items: center; padding-top: 6px; }
-  .thinking-dots span {
-    width: 5px; height: 5px; border-radius: 50%;
-    background: var(--accent);
-    animation: pulse 1.2s ease-in-out infinite;
-    opacity: 0.3;
+  /* ── Inline Status Indicator ───────────────────── */
+  .msg-status {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text3);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    min-height: 18px;
+    padding: 6px 8px;
+    background: var(--surface1);
+    border: 1px solid var(--border1);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 0.2s ease;
   }
-  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes pulse { 0%,100%{opacity:0.3;transform:scale(1)} 50%{opacity:1;transform:scale(1.3)} }
+  .msg-status:hover {
+    background: var(--surface2);
+    border-color: var(--border2);
+  }
+  .msg-status .spinner {
+    width: 10px; height: 10px;
+    border: 1.5px solid var(--border2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  .msg-status .status-text {
+    flex: 1;
+  }
+  .msg-status .status-timer {
+    font-size: 10px;
+    color: var(--text3);
+    margin-left: auto;
+  }
+  .msg-status .status-chevron {
+    width: 12px; height: 12px;
+    color: var(--text3);
+    transition: transform 0.2s ease;
+  }
+  .msg-status.collapsed .status-chevron {
+    transform: rotate(-90deg);
+  }
+  .msg-status .status-details {
+    display: none;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border1);
+    font-size: 10px;
+  }
+  .msg-status:not(.collapsed) .status-details {
+    display: block;
+  }
 
   /* ── Agent step trace ───────────────────────────────────── */
   .agent-trace {
@@ -863,6 +906,47 @@
   .msg-action-btn:hover { border-color: var(--border2); color: var(--text2); background: var(--surface2); }
   .msg-action-btn.voted { color: var(--accent); border-color: var(--accent2); }
 
+  /* ── File result link ────────────────────────────────────── */
+  .file-result-link {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 8px; padding: 7px 10px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; font-size: 12px;
+  }
+  .file-result-link svg { color: var(--accent); flex-shrink: 0; }
+  .file-link-name {
+    color: var(--accent); text-decoration: none; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px;
+  }
+  .file-link-name:hover { text-decoration: underline; }
+  .file-link-path {
+    color: var(--text3); font-family: var(--mono); font-size: 10px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1;
+  }
+
+  /* ── Thinking stream indicator ───────────────────────────── */
+  .thinking-step {
+    font-size: 11px; color: var(--text3); font-family: var(--mono);
+    padding: 2px 0; display: flex; align-items: center; gap: 6px;
+  }
+  .thinking-step::before { content: '›'; color: var(--accent2); }
+
+  /* ── Permission gate ─────────────────────────────────────── */
+  .permission-gate {
+    margin-top: 8px; padding: 10px 12px;
+    background: rgba(61,214,140,0.06); border: 1px solid var(--accent2);
+    border-radius: 6px;
+  }
+  .permission-gate-btns { display: flex; gap: 8px; margin-top: 8px; }
+  .perm-btn {
+    padding: 4px 14px; border-radius: 4px; border: 1px solid var(--border2);
+    cursor: pointer; font-family: var(--mono); font-size: 11px;
+    background: var(--surface); color: var(--text2);
+  }
+  .perm-btn.confirm { border-color: var(--accent2); color: var(--accent); }
+  .perm-btn.confirm:hover { background: var(--accent); color: var(--bg); }
+  .perm-btn.deny:hover { border-color: var(--red); color: var(--red); }
+
   /* ── F9: Stop button ─────────────────────────────────────── */
   #send-btn.stop { background: rgba(224,85,85,0.15); border-color: var(--red); color: var(--red); }
   #send-btn.stop:hover { background: var(--red); color: var(--bg); }
@@ -1006,7 +1090,7 @@
       <div class="ollama-popover" id="ollama-popover">
         <div class="ollama-popover-title">Ollama</div>
         <button class="ollama-popover-btn" id="ollama-start-btn" onclick="ollamaStart(event)">▶ Start Ollama</button>
-        <select class="ollama-model-select" id="ollama-model-select" onchange="ollamaSelectModel(this.value)">
+        <select class="ollama-model-select" id="ollama-model-select">
           <option value="">Loading models…</option>
         </select>
         <div class="ollama-pull-row">
@@ -1127,6 +1211,19 @@ let deleteTargetId = null;
 let obsCollapsed = window.innerWidth < 900;
 let msgHistory = [];           // F7: ↑ fill previous message
 
+// Language extensions for code download
+const _LANG_EXT = {
+  "python": ".py", "py": ".py",
+  "javascript": ".js", "js": ".js",
+  "typescript": ".ts", "ts": ".ts",
+  "bash": ".sh", "sh": ".sh", "shell": ".sh",
+  "html": ".html", "css": ".css",
+  "json": ".json", "yaml": ".yaml", "yml": ".yaml",
+  "toml": ".toml", "sql": ".sql",
+  "rust": ".rs", "go": ".go",
+  "markdown": ".md", "md": ".md",
+};
+
 const STARTERS = [
   { label: 'web search', text: 'What are the latest developments in local LLMs?' },
   { label: 'memory', text: 'Remember that I prefer concise, direct answers' },
@@ -1176,7 +1273,7 @@ function newSession() {
 
 function clearMessages() {
   const msgs = document.getElementById('messages');
-  msgs.querySelectorAll('.msg-row, .thinking-row').forEach(e => e.remove());
+  msgs.querySelectorAll('.msg-row').forEach(e => e.remove());
   document.getElementById('empty-state').style.display = 'flex';
   clearObsPanel();
   msgHistory = [];
@@ -1256,20 +1353,29 @@ async function confirmDelete() {
 }
 
 // ── File handling ──────────────────────────────────────────────────────────
+let pendingFilePath = null;  // full path when browser exposes it
+
 function handleFile(input) {
   const file = input.files ? input.files[0] : input;
   if (!file) return;
   pendingFileName = file.name;
+  // Browsers expose webkitRelativePath or path in some Electron/desktop contexts
+  pendingFilePath = file.path || file.webkitRelativePath || null;
   const reader = new FileReader();
   reader.onload = e => { pendingFileBytes = e.target.result; };
   reader.readAsArrayBuffer(file);
-  document.getElementById('file-name').textContent = file.name;
+  const nameEl = document.getElementById('file-name');
+  nameEl.textContent = pendingFilePath
+    ? `${file.name}  —  ${pendingFilePath}`
+    : file.name;
+  nameEl.title = pendingFilePath || file.name;
   document.getElementById('file-preview').classList.add('visible');
 }
 
 function clearFile() {
   pendingFileBytes = null;
   pendingFileName = null;
+  pendingFilePath = null;
   document.getElementById('file-input').value = '';
   document.getElementById('file-preview').classList.remove('visible');
 }
@@ -1339,7 +1445,7 @@ document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === '/') { e.preventDefault(); toggleObsPanel(); }
   if ((e.ctrlKey || e.metaKey) && e.key === 'l') {
     e.preventDefault();
-    document.getElementById('messages').querySelectorAll('.msg-row,.thinking-row').forEach(r => r.remove());
+    document.getElementById('messages').querySelectorAll('.msg-row').forEach(r => r.remove());
     document.getElementById('empty-state').style.display = 'flex';
   }
   if (e.key === 'Escape' && streaming) {
@@ -1378,7 +1484,40 @@ async function sendMessage() {
   clearObsPanel();
 
   appendMessage('user', text);
-  showThinking();
+
+  const row = appendMessage('assistant', '', { streaming: true });
+  const contentEl = row.querySelector('.msg-content');
+
+  // F2: inline status with timer and collapse
+  const statusEl = document.createElement('div');
+  statusEl.className = 'msg-status';
+  statusEl.innerHTML = `
+    <div class="spinner"></div>
+    <span class="status-text">Thinking…</span>
+    <span class="status-timer">0s</span>
+    <svg class="status-chevron" fill="currentColor" viewBox="0 0 20 20" style="width:12px;height:12px">
+      <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"/>
+    </svg>
+    <div class="status-details"></div>
+  `;
+  
+  // Start timer
+  const startTime = Date.now();
+  const timerEl = statusEl.querySelector('.status-timer');
+  const timerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    timerEl.textContent = `${elapsed}s`;
+  }, 1000);
+  
+  // Store timer interval for cleanup
+  statusEl._timerInterval = timerInterval;
+  
+  // Add click handler for collapse/expand
+  statusEl.addEventListener('click', () => {
+    statusEl.classList.toggle('collapsed');
+  });
+  
+  row.querySelector('.msg-body').appendChild(statusEl);
 
   const formData = new FormData();
   formData.append('message', text);
@@ -1386,27 +1525,23 @@ async function sendMessage() {
 
   if (pendingFileBytes && pendingFileName) {
     formData.append('file', new Blob([pendingFileBytes]), pendingFileName);
+    if (pendingFilePath) formData.append('file_full_path', pendingFilePath);
     clearFile();
   }
 
   try {
     const response = await fetch(`${API}/api/chat`, { method: 'POST', body: formData });
-    removeThinking();
 
     if (!response.ok) {
-      appendMessage('assistant', `Error ${response.status}: ${await response.text()}`);
+      if (statusEl && statusEl._timerInterval) {
+        clearInterval(statusEl._timerInterval);
+      }
+      statusEl?.remove();
+      contentEl.innerHTML = `Error ${response.status}: ${await response.text()}`;
       return;
     }
 
-    const row = appendMessage('assistant', '', { streaming: true });
-    const contentEl = row.querySelector('.msg-content');
-
-    // F2: status line
-    const statusEl = document.createElement('div');
-    statusEl.className = 'msg-status';
-    statusEl.innerHTML = '<div class="spinner"></div><span>Thinking…</span>';
-    row.querySelector('.msg-body').appendChild(statusEl);
-
+    // F2: status line (now using the inline status)
     let rawText = '';
     let firstToken = false;
     let agentTrace = null;
@@ -1424,7 +1559,10 @@ async function sendMessage() {
           const data = JSON.parse(line.slice(6));
           if (data.error) {
             contentEl.innerHTML = `<em style="color:var(--red)">Error: ${escHtml(data.error)}</em>`;
-            statusEl.remove();
+            if (statusEl && statusEl._timerInterval) {
+              clearInterval(statusEl._timerInterval);
+            }
+            statusEl?.remove();
             break outer;
           }
           // F2: update status from obs events
@@ -1432,41 +1570,67 @@ async function sendMessage() {
             addObsEvent(data.obs_event);
             if (!firstToken) {
               const evt = data.obs_event;
+              const textEl = statusEl?.querySelector('.status-text');
+              const detailsEl = statusEl?.querySelector('.status-details');
               if (evt.type === 'tool_dispatched') {
-                statusEl.querySelector('span').textContent = toolStatusLabel[evt.data?.tool] || 'Working…';
+                if (textEl) textEl.textContent = toolStatusLabel[evt.data?.tool] || 'Working…';
+                if (detailsEl) detailsEl.textContent = `Tool: ${evt.data?.tool}`;
               } else if (evt.type === 'agent_loop_start') {
-                statusEl.querySelector('span').textContent = 'Reasoning…';
+                if (textEl) textEl.textContent = 'Reasoning…';
+                if (detailsEl) detailsEl.textContent = 'Agent loop started';
+              } else if (evt.type === 'safety_blocked') {
+                if (textEl) textEl.textContent = 'Blocked';
               }
             }
-            // F3: capture agent trace
+            // Permission gate — render confirm/deny UI
+            if (data.obs_event.type === 'permission_required') {
+              const d = data.obs_event.data || {};
+              if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
+              statusEl?.remove();
+              firstToken = true;
+              renderPermissionGate(row, d.pending_path, d.pending_content, d.filename);
+            }
             if (data.obs_event.agent_trace) agentTrace = data.obs_event.agent_trace;
-            // F5: token bar from turn_complete
             if (data.obs_event.type === 'turn_complete') {
               const d = data.obs_event.data || {};
               if (d.tokens_approx) updateTokenBar(d.tokens_approx, 8192);
-              // F10: model pill
               if (d.model) updateModelPill(d.model);
             }
           }
           if (data.text) {
-            if (!firstToken) { firstToken = true; statusEl.remove(); }
-            rawText += data.text;
-            contentEl.innerHTML = renderMarkdown(rawText);
-            scrollToBottom();
+            // Filter out internal agent status lines before first real content
+            const isStatusLine = data.text.match(/^[\n\r]*_\[(?:Thinking|Using)[^\]]*\]_[\n\r]*$/);
+            if (isStatusLine) {
+              // Show as thinking indicator, not in main content
+              const textEl = statusEl?.querySelector('.status-text');
+              if (textEl && !firstToken) {
+                const label = data.text.replace(/_\[|\]_/g, '').trim();
+                textEl.textContent = label.substring(0, 60);
+              }
+            } else {
+              if (!firstToken) {
+                firstToken = true;
+                if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
+                statusEl?.remove();
+              }
+              rawText += data.text;
+              contentEl.innerHTML = renderMarkdown(rawText);
+              scrollToBottom();
+            }
           }
           if (data.intent) updateSessionPills(data.intent, data.confidence);
           if (data.memory_facts) showMemoryChips(row, data.memory_facts);
           if (data.done) {
-            statusEl.remove();
-            // B1: empty bubble fallback
+            if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
+            statusEl?.remove();
+            finalizeMessageTime(row);
             if (!rawText) {
-              contentEl.innerHTML = '<em style="color:var(--text3)">⚠ No response — check that Ollama is running.</em>';
+              contentEl.innerHTML = '<em style="color:var(--text3)">⚠ No response — check Ollama is running.</em>';
             }
-            // F3: render agent trace if present
             if (agentTrace) renderAgentTrace(row, agentTrace);
-            // F8: add action toolbar
-            addMessageActions(row, rawText);
-            // B2: load sessions only after done
+            addMessageToolbar(row, rawText);
+            // Render file links from tool metadata
+            if (data.file_path) renderFileLink(row, data.file_path, data.file_name);
             await loadSessions();
             break outer;
           }
@@ -1476,12 +1640,20 @@ async function sendMessage() {
     streamReader = null;
   } catch(e) {
     if (e.name !== 'AbortError') {
-      removeThinking();
-      appendMessage('assistant', `Connection error: ${e.message}`);
+      if (statusEl && statusEl._timerInterval) {
+        clearInterval(statusEl._timerInterval);
+      }
+      statusEl?.remove();
+      contentEl.innerHTML = `Connection error: ${e.message}`;
     }
   } finally {
     setStreamingState(false);
     streamReader = null;
+    // Clean up status if still present
+    if (statusEl && statusEl._timerInterval) {
+      clearInterval(statusEl._timerInterval);
+    }
+    statusEl?.remove();
   }
 }
 
@@ -1489,7 +1661,7 @@ async function sendMessage() {
 function appendMessage(role, content, opts = {}) {
   const msgs = document.getElementById('messages');
   const row = document.createElement('div');
-  row.className = `msg-row role-${role}`; // B3: role class
+  row.className = `msg-row role-${role}`;
 
   const avatar = document.createElement('div');
   avatar.className = `msg-avatar ${role}`;
@@ -1498,13 +1670,14 @@ function appendMessage(role, content, opts = {}) {
   const body = document.createElement('div');
   body.className = 'msg-body';
 
-  const ts = opts.timestamp ? new Date(opts.timestamp * 1000) : new Date();
-  const timeStr = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // User messages timestamp immediately; assistant timestamps on completion
+  const ts = opts.timestamp ? new Date(opts.timestamp * 1000) : (role === 'user' ? new Date() : null);
+  const timeStr = ts ? ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '…';
 
   body.innerHTML = `
     <div class="msg-meta">
       <span class="msg-role">${role === 'user' ? 'you' : 'localmind'}</span>
-      <span class="msg-time">${timeStr}</span>
+      <span class="msg-time" data-pending="${role === 'assistant' && !opts.timestamp ? '1' : ''}">${timeStr}</span>
     </div>
     <div class="msg-content">${opts.streaming ? '' : renderMarkdown(content)}</div>`;
 
@@ -1512,26 +1685,18 @@ function appendMessage(role, content, opts = {}) {
   row.appendChild(body);
   msgs.appendChild(row);
 
-  // F8: add action toolbar to non-streaming messages immediately
-  if (!opts.streaming && content) addMessageActions(row, content);
-
+  if (!opts.streaming && content) addMessageToolbar(row, content);
   scrollToBottom();
   return row;
 }
 
-function showThinking() {
-  const msgs = document.getElementById('messages');
-  const row = document.createElement('div');
-  row.className = 'thinking-row';
-  row.id = 'thinking';
-  row.innerHTML = `
-    <div class="msg-avatar assistant">lm</div>
-    <div class="thinking-dots"><span></span><span></span><span></span></div>`;
-  msgs.appendChild(row);
-  scrollToBottom();
+function finalizeMessageTime(row) {
+  const timeEl = row.querySelector('.msg-time[data-pending="1"]');
+  if (timeEl) {
+    timeEl.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    timeEl.removeAttribute('data-pending');
+  }
 }
-
-function removeThinking() { document.getElementById('thinking')?.remove(); }
 
 function showMemoryChips(row, facts) {
   if (!facts || !facts.length) return;
@@ -1576,44 +1741,128 @@ function renderAgentTrace(row, trace) {
   body.appendChild(block);
 }
 
-// F8: Response action toolbar
-function addMessageActions(row, text) {
+// File link renderer — clickable link that opens file with default program
+function renderFileLink(row, filePath, fileName) {
+  if (!filePath) return;
   const body = row.querySelector('.msg-body');
-  const role = row.className.includes('role-assistant') ? 'assistant' : 'user';
-  if (role === 'user') return; // only on assistant messages
+  const linkEl = document.createElement('div');
+  linkEl.className = 'file-result-link';
+  const name = fileName || filePath.split(/[\\/]/).pop();
+  linkEl.innerHTML = `
+    <svg width="14" height="14" fill="currentColor" viewBox="0 0 20 20">
+      <path d="M4 4a2 2 0 012-2h4l6 6v8a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/>
+    </svg>
+    <a href="#" class="file-link-name" data-path="${escHtml(filePath)}" title="${escHtml(filePath)}">${escHtml(name)}</a>
+    <span class="file-link-path">${escHtml(filePath)}</span>
+  `;
+  linkEl.querySelector('.file-link-name').addEventListener('click', async (e) => {
+    e.preventDefault();
+    try {
+      await fetch(`${API}/api/open-file`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ path: filePath }),
+      });
+    } catch(err) { console.warn('open-file failed', err); }
+  });
+  body.appendChild(linkEl);
+}
 
+// Permission gate — renders confirm/deny buttons when file_writer needs user approval
+function renderPermissionGate(row, pendingPath, pendingContent, filename) {
+  const body = row.querySelector('.msg-body');
+  const gate = document.createElement('div');
+  gate.className = 'permission-gate';
+  gate.innerHTML = `
+    <div style="font-size:12px;color:var(--text2)">
+      Allow LocalMind to write <strong>${escHtml(filename)}</strong>?<br>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--text3)">${escHtml(pendingPath)}</span>
+    </div>
+    <div class="permission-gate-btns">
+      <button class="perm-btn confirm" data-path="${escHtml(pendingPath)}" data-content="${escHtml(pendingContent)}">✓ Yes, write it</button>
+      <button class="perm-btn deny">✕ No</button>
+    </div>
+  `;
+  gate.querySelector('.perm-btn.confirm').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.textContent = 'Writing…';
+    btn.disabled = true;
+    try {
+      const r = await fetch(`${API}/api/confirm-write`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: btn.dataset.path, content: btn.dataset.content }),
+      });
+      const data = await r.json();
+      gate.innerHTML = `<div style="font-size:12px;color:var(--accent)">✓ Written: <code>${escHtml(data.path)}</code></div>`;
+      renderFileLink(row, data.path, data.filename);
+    } catch(err) {
+      gate.innerHTML = `<div style="color:var(--red);font-size:12px">Write failed: ${err.message}</div>`;
+    }
+  });
+  gate.querySelector('.perm-btn.deny').addEventListener('click', () => {
+    gate.innerHTML = `<div style="font-size:12px;color:var(--text3)">Write cancelled.</div>`;
+  });
+  body.appendChild(gate);
+}
+
+function addMessageToolbar(row, text) {
+  const body = row.querySelector('.msg-body');
   const toolbar = document.createElement('div');
-  toolbar.className = 'msg-actions';
+  toolbar.className = 'msg-toolbar';
 
+  // Copy button
   const copyBtn = document.createElement('button');
   copyBtn.className = 'msg-action-btn';
   copyBtn.textContent = '📋 copy';
   copyBtn.onclick = () => {
-    navigator.clipboard.writeText(text).then(() => {
+    const plain = text.replace(/<[^>]*>/g, '');
+    navigator.clipboard.writeText(plain).then(() => {
       copyBtn.textContent = '✓ copied';
       setTimeout(() => { copyBtn.textContent = '📋 copy'; }, 1500);
     });
   };
 
+  // Download button — saves the message as .md or extracts code as file
+  const dlBtn = document.createElement('button');
+  dlBtn.className = 'msg-action-btn';
+  dlBtn.textContent = '⬇ save';
+  dlBtn.onclick = () => {
+    const codeMatch = text.match(/```(\w+)?\n([\s\S]+?)\n```/);
+    let blob, filename;
+    if (codeMatch) {
+      const lang = codeMatch[1] || 'txt';
+      const extMap = {python:'py',javascript:'js',typescript:'ts',bash:'sh',html:'html',css:'css',json:'json'};
+      filename = `localmind_code.${extMap[lang] || lang}`;
+      blob = new Blob([codeMatch[2]], {type: 'text/plain'});
+    } else {
+      filename = 'localmind_response.md';
+      blob = new Blob([text], {type: 'text/markdown'});
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  // Regenerate button
   const regenBtn = document.createElement('button');
   regenBtn.className = 'msg-action-btn';
   regenBtn.textContent = '↺ regen';
   regenBtn.onclick = () => {
-    // find the preceding user message
     const rows = [...document.querySelectorAll('.msg-row')];
     const idx = rows.indexOf(row);
     if (idx > 0) {
       const prevUser = rows.slice(0, idx).reverse().find(r => r.classList.contains('role-user'));
       if (prevUser) {
         const content = prevUser.querySelector('.msg-content')?.textContent || '';
-        if (content) {
-          document.getElementById('msg-input').value = content;
-          sendMessage();
-        }
+        if (content) { document.getElementById('msg-input').value = content; sendMessage(); }
       }
     }
   };
 
+  // Thumb up button
   const thumbUpBtn = document.createElement('button');
   thumbUpBtn.className = 'msg-action-btn';
   thumbUpBtn.textContent = '👍';
@@ -1630,9 +1879,10 @@ function addMessageActions(row, text) {
     thumbUpBtn.classList.remove('voted');
   };
 
-  toolbar.append(copyBtn, regenBtn, thumbUpBtn, thumbDownBtn);
+  toolbar.append(copyBtn, dlBtn, regenBtn, thumbUpBtn, thumbDownBtn);
   body.appendChild(toolbar);
 }
+
 
 function updateSessionPills(intent, confidence) {
   const ip = document.getElementById('intent-pill');
@@ -1794,6 +2044,10 @@ function toggleOllamaPopover(e) {
   if (ollamaPopoverOpen) loadOllamaModels();
 }
 
+// Stop ALL clicks inside the popover from bubbling to document
+document.getElementById('ollama-popover').addEventListener('click', e => e.stopPropagation());
+document.getElementById('ollama-popover').addEventListener('mousedown', e => e.stopPropagation());
+
 document.addEventListener('click', () => {
   if (ollamaPopoverOpen) {
     ollamaPopoverOpen = false;
@@ -1834,18 +2088,41 @@ async function ollamaStart(e) {
 
 async function ollamaSelectModel(model) {
   if (!model) return;
+  const sel = document.getElementById('ollama-model-select');
+  const hint = document.getElementById('model-hint');
+  const origText = hint.textContent;
+  hint.textContent = 'Switching…';
+  sel.disabled = true;
   try {
     const r = await fetch(`${API}/api/models/select`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model }),
     });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: 'Unknown error' }));
+      hint.textContent = `Error: ${err.detail || 'failed'}`;
+      setTimeout(() => { hint.textContent = origText; }, 3000);
+      return;
+    }
     const data = await r.json();
-    document.getElementById('model-hint').textContent = data.selected;
+    hint.textContent = `✓ ${data.selected}`;
     updateModelPill(data.selected);
     checkHealth();
-  } catch(e) { console.warn('Model select failed', e); }
+    setTimeout(() => { hint.textContent = data.selected; }, 2000);
+  } catch(e) {
+    hint.textContent = 'Connection error';
+    setTimeout(() => { hint.textContent = origText; }, 2000);
+  } finally {
+    sel.disabled = false;
+  }
 }
+
+// Wire select change — must be done after DOM is ready
+document.getElementById('ollama-model-select').addEventListener('change', function(e) {
+  e.stopPropagation();
+  ollamaSelectModel(this.value);
+});
 
 async function ollamaPull() {
   const input = document.getElementById('ollama-pull-input');

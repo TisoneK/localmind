@@ -1,6 +1,6 @@
 """Model listing and selection endpoints."""
 from __future__ import annotations
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from adapters.ollama import OllamaAdapter
@@ -26,6 +26,15 @@ class ModelInfo(BaseModel):
     min_ram_gb: int
     available: bool
     active: bool
+
+
+class SelectModelRequest(BaseModel):
+    model: str
+
+
+class SelectModelResponse(BaseModel):
+    selected: str
+    message: str
 
 
 @router.get("/models", response_model=list[ModelInfo])
@@ -65,3 +74,41 @@ async def list_models():
             ))
 
     return results
+
+
+@router.post("/models/select", response_model=SelectModelResponse)
+async def select_model(req: SelectModelRequest):
+    """
+    Hot-swap the active model at runtime without restarting.
+    Validates that the model is actually pulled before switching.
+    """
+    if not req.model or not req.model.strip():
+        raise HTTPException(status_code=400, detail="model name cannot be empty")
+
+    model = req.model.strip()
+
+    # Verify the model exists in Ollama before switching
+    adapter = OllamaAdapter()
+    try:
+        available = set(await adapter.list_models())
+    except Exception:
+        available = set()
+
+    # Accept exact match or prefix match (e.g. "llama3.1" for "llama3.1:8b")
+    model_available = model in available or any(
+        a.startswith(model.split(":")[0]) for a in available
+    )
+
+    if not model_available and available:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model}' is not pulled. Run: ollama pull {model}"
+        )
+
+    # Mutate settings in-place — all subsequent Engine instances read from settings
+    settings.ollama_model = model
+
+    return SelectModelResponse(
+        selected=model,
+        message=f"Active model switched to {model}",
+    )

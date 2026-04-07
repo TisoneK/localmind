@@ -37,12 +37,14 @@ _RULE_CONFIDENCE_THRESHOLD = 0.80
 
 # Rule-based confidence heuristic: non-CHAT matches are strong signals
 _RULE_CONFIDENCE_BY_INTENT: dict[str, float] = {
-    Intent.WEB_SEARCH.value:  0.88,
+    Intent.WEB_SEARCH.value:  0.72,
     Intent.CODE_EXEC.value:   0.92,
+    Intent.SHELL.value:       0.90,
+    Intent.SYSINFO.value:     0.95,  # very high — offline, always correct to use
     Intent.MEMORY_OP.value:   0.90,
     Intent.FILE_TASK.value:   0.90,
     Intent.FILE_WRITE.value:  0.88,
-    Intent.CHAT.value:        0.60,   # CHAT is the catch-all — ambiguous by definition
+    Intent.CHAT.value:        0.85,
 }
 
 _CLASSIFIER_SYSTEM = """You are an intent classifier for a local AI assistant.

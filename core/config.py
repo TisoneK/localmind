@@ -2,8 +2,50 @@
 LocalMind configuration — loaded from environment / .env file.
 All settings validated by Pydantic at startup.
 """
+import os
+import sys
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+
+
+def _default_home() -> str:
+    """Return platform-appropriate LocalMind home directory."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("USERPROFILE", Path.home()))
+    else:
+        base = Path.home()
+    return str(base / "LocalMind")
+
+
+def _default_uploads() -> str:
+    return str(Path(_default_home()) / "uploads")
+
+
+def _allowed_user_folders() -> list[str]:
+    """Folders the model is allowed to READ from (never OS/system folders)."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("USERPROFILE", Path.home()))
+        return [
+            str(base / "Downloads"),
+            str(base / "Documents"),
+            str(base / "Pictures"),
+            str(base / "Videos"),
+            str(base / "Music"),
+            str(base / "Desktop"),
+            str(Path(_default_home())),
+        ]
+    else:
+        home = Path.home()
+        return [
+            str(home / "Downloads"),
+            str(home / "Documents"),
+            str(home / "Pictures"),
+            str(home / "Videos"),
+            str(home / "Music"),
+            str(home / "Desktop"),
+            str(Path(_default_home())),
+        ]
 
 
 class Settings(BaseSettings):
@@ -12,6 +54,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        frozen=False,   # allow hot-swap of ollama_model at runtime
     )
 
     # Ollama
@@ -27,9 +70,11 @@ class Settings(BaseSettings):
     localmind_port: int = 8000
     localmind_log_level: str = "INFO"
 
-    # Storage
-    localmind_db_path: str = "./localmind.db"
-    localmind_chroma_path: str = "./chroma_db"
+    # Storage — default to ~/LocalMind/
+    localmind_home: str = Field(default_factory=_default_home)
+    localmind_db_path: str = ""          # resolved at startup if empty
+    localmind_chroma_path: str = ""      # resolved at startup if empty
+    localmind_uploads_path: str = Field(default_factory=_default_uploads)
 
     # File reader
     localmind_max_file_size_mb: int = 50
@@ -44,19 +89,52 @@ class Settings(BaseSettings):
     localmind_code_exec_timeout: int = 30
     localmind_code_exec_enabled: bool = True
 
+    # Shell tool
+    localmind_shell_enabled: bool = False
+
     # Context window management
     localmind_response_reserve_tokens: int = 2048
     localmind_history_max_tokens: int = 4096
 
-    # Model routing — optional fast/code-specialized models
-    # If not set, falls back to ollama_model for all requests
-    ollama_model_fast: str = ""   # e.g. "phi3:mini" for short CHAT turns
-    ollama_model_code: str = ""   # e.g. "qwen2.5-coder:7b" for CODE_EXEC
+    # Model routing
+    ollama_model_fast: str = ""
+    ollama_model_code: str = ""
 
     # Agent loop
     localmind_agent_enabled: bool = True
     localmind_agent_max_iterations: int = 6
 
+    # Permission gates — require user confirmation before write/delete
+    localmind_require_write_permission: bool = True
 
-# Singleton — import this everywhere
+    def resolve_paths(self) -> None:
+        """Resolve dynamic paths after init. Call once at startup."""
+        home = Path(self.localmind_home)
+        home.mkdir(parents=True, exist_ok=True)
+        Path(self.localmind_uploads_path).mkdir(parents=True, exist_ok=True)
+        if not self.localmind_db_path:
+            self.localmind_db_path = str(home / "localmind.db")
+        if not self.localmind_chroma_path:
+            self.localmind_chroma_path = str(home / "chroma_db")
+
+    def allowed_read_paths(self) -> list[Path]:
+        return [Path(p) for p in _allowed_user_folders()]
+
+    def is_path_allowed(self, path: Path) -> bool:
+        """Return True if path is within an allowed user folder."""
+        try:
+            resolved = path.resolve()
+        except Exception:
+            return False
+        for allowed in self.allowed_read_paths():
+            try:
+                resolved.relative_to(allowed.resolve())
+                return True
+            except ValueError:
+                continue
+        return False
+
+
+# Singleton
 settings = Settings()
+settings.resolve_paths()

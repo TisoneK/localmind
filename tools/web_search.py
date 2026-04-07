@@ -20,8 +20,9 @@ SNIPPET_MAX = 300
 async def _search_ddg(query: str) -> list[dict]:
     try:
         from ddgs import DDGS
+        safe_query = query.encode("utf-8", errors="replace").decode("utf-8")
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=MAX_RESULTS))
+            results = list(ddgs.text(safe_query, max_results=MAX_RESULTS))
         return results
     except Exception as e:
         error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
@@ -32,6 +33,8 @@ async def _search_ddg(query: str) -> list[dict]:
 async def _search_brave(query: str, api_key: str) -> list[dict]:
     try:
         import httpx
+        import urllib.parse
+        safe_query = urllib.parse.quote(query.encode("utf-8", errors="replace").decode("utf-8"))
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",

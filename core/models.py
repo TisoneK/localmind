@@ -20,6 +20,8 @@ class Intent(str, Enum):
     FILE_TASK = "file_task"
     WEB_SEARCH = "web_search"
     CODE_EXEC = "code_exec"
+    SHELL = "shell"
+    SYSINFO = "sysinfo"
     MEMORY_OP = "memory_op"
     FILE_WRITE = "file_write"
     CHAT = "chat"

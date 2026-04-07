@@ -109,6 +109,8 @@ def available_tools() -> list[dict]:
 # Import order matters: file_reader must be before engine uses parse_file
 from tools import file_reader   # noqa: E402, F401 — registers FILE_TASK
 from tools import web_search    # noqa: E402, F401 — registers WEB_SEARCH
-from tools import code_exec     # noqa: E402, F401 — registers CODE_EXEC (parallelizable=False set inside)
+from tools import code_exec     # noqa: E402, F401 — registers CODE_EXEC
+from tools import shell         # noqa: E402, F401 — registers SHELL
+from tools import sysinfo       # noqa: E402, F401 — registers SYSINFO (offline: time, date, specs)
 from tools import memory_tool   # noqa: E402, F401 — registers MEMORY_OP
 from tools import file_writer   # noqa: E402, F401 — FILE_WRITE (secondary intent)

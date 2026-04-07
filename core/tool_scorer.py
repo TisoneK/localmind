@@ -86,6 +86,10 @@ def score_tools(
     Returns:
         List of ScoredTool sorted by score descending.
     """
+    # CHAT intent should never use tools - handle directly by LLM
+    if primary_intent == Intent.CHAT:
+        return []
+        
     scored = []
     for tool in available:
         tool_intent_str = tool["intent"]

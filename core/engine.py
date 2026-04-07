@@ -39,17 +39,47 @@ from tools import dispatch, available_tools
 logger = logging.getLogger(__name__)
 
 
+from core.model_router import best_model_for, update_pulled_models
+
+
 class Engine:
     def __init__(self):
         self._store = SessionStore(settings.localmind_db_path)
         self._adapter = get_adapter(settings.localmind_adapter)
         self._memory = MemoryComposer()
         self._agent_loop = AgentLoop(adapter=self._adapter)
-        # A4: Bootstrap tool reliability from historical DB stats
+        # Bootstrap tool reliability from historical DB stats
         try:
             load_reliability_from_db(self._store.get_reliability())
         except Exception as e:
             logger.debug(f"[engine] reliability bootstrap skipped: {e}")
+        # Bootstrap model router with currently pulled models
+        try:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                # If there's already a running loop, create a task
+                asyncio.create_task(self._refresh_model_router())
+            except RuntimeError:
+                # No running loop, we can run it directly
+                asyncio.run(self._refresh_model_router())
+        except Exception as e:
+            logger.debug(f"[engine] model router bootstrap skipped: {e}")
+
+    async def _refresh_model_router(self) -> None:
+        """Refresh the model router's knowledge of pulled models."""
+        try:
+            pulled = await self._adapter.list_models()
+            update_pulled_models(pulled)
+        except Exception as e:
+            logger.debug(f"[engine] model router refresh failed: {e}")
+
+    def _adapter_for(self, intent: Intent):
+        """Return an adapter configured with the best model for this intent."""
+        model = best_model_for(intent, fallback=settings.ollama_model)
+        if model == settings.ollama_model:
+            return self._adapter  # reuse existing adapter — no extra allocation
+        return get_adapter(settings.localmind_adapter, model_override=model)
 
     async def process(
         self,
@@ -67,11 +97,54 @@ class Engine:
         _obs = obs or ObsCollector()  # no-op collector if caller doesn't care
         t0 = time.monotonic()
 
+        # ── 0. Safety gate ────────────────────────────────────────────────
+        from core.safety_gate import check as safety_check
+        is_safe, gate_reason = safety_check(message)
+        if not is_safe:
+            _obs = obs or ObsCollector()
+            _obs.emit("safety_blocked", reason=gate_reason[:80])
+            yield StreamChunk(text=gate_reason, done=False)
+            yield StreamChunk(text="", done=True)
+            return
+
         # ── 1. History ────────────────────────────────────────────────────
         history = self._store.get_history(session_id)
 
-        # ── 2. LLM Intent Classification ──────────────────────────────────
+        # ── 1a. Fast-path: obvious CHAT messages bypass the full pipeline ──
+        # The rule-based router can already confirm CHAT with high confidence
+        # for greetings, short replies, and unambiguous conversational messages.
+        # Skip classifier LLM call, memory embed, tool dispatch for these.
         has_attachment = file is not None
+        from core import intent_router as _router
+        _fast_primary, _fast_secondary = _router.classify_multi(message, has_attachment)
+        if _fast_primary == Intent.CHAT and not has_attachment:
+            from core.intent_classifier import _RULE_CONFIDENCE_BY_INTENT
+            _fast_conf = _RULE_CONFIDENCE_BY_INTENT.get(Intent.CHAT.value, 0.85)
+            _obs.emit("intent_classified", primary="chat", secondary="none", confidence=_fast_conf)
+            ctx = EngineContext(
+                session_id=session_id,
+                message=message,
+                intent=Intent.CHAT,
+                history=history,
+                tool_result=None,
+                file_attachment=None,
+                memory_facts=[],
+            )
+            prompt_messages = context_builder.build(ctx, self._adapter.context_window)
+            full_response = []
+            async for chunk in self._adapter.chat(prompt_messages):
+                full_response.append(chunk.text)
+                yield chunk
+            response_text = "".join(full_response)
+            self._store.append(session_id, Message(role=Role.USER, content=message))
+            self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
+            _obs.emit("turn_complete", intent="chat", confidence=_fast_conf,
+                      tokens_approx=len(response_text) // 4,
+                      total_latency_ms=round((time.monotonic() - t0) * 1000),
+                      memory_facts=0, agent_mode=False)
+            return
+
+        # ── 2. LLM Intent Classification ──────────────────────────────────
         primary_intent, secondary_intent, confidence = await classify_with_llm(
             message=message,
             has_attachment=has_attachment,
@@ -124,19 +197,43 @@ class Engine:
             t_tool = time.monotonic()
             try:
                 tool_result = await dispatch(effective_intent, message)
+
+                # ── Permission gate short-circuit ──────────────────────────
+                # If tool requires user confirmation before proceeding,
+                # stream the gate event and stop — do not call the LLM.
+                if tool_result and tool_result.requires_confirmation:
+                    _obs.emit("permission_required",
+                              tool=effective_intent.value,
+                              pending_path=tool_result.metadata.get("pending_path", ""),
+                              pending_content=tool_result.metadata.get("pending_content", ""),
+                              filename=tool_result.metadata.get("filename", ""))
+                    yield StreamChunk(text=tool_result.content, done=False)
+                    yield StreamChunk(text="", done=True)
+                    # Store user message but not assistant — gate hasn't resolved
+                    self._store.append(session_id, Message(role=Role.USER, content=message))
+                    return
+
+                tool_ok = (
+                    tool_result is not None
+                    and tool_result.content.strip()
+                    and tool_result.content.strip() != "No results found."
+                )
                 _obs.emit("tool_dispatched",
                           tool=effective_intent.value,
-                          success=tool_result is not None,
+                          success=tool_ok,
                           latency_ms=round((time.monotonic() - t_tool) * 1000))
-                # A4: record success
-                record_tool_outcome(self._store, effective_intent.value, success=True,
+                record_tool_outcome(self._store, effective_intent.value, success=tool_ok,
                                     latency_ms=round((time.monotonic() - t_tool) * 1000))
+                if not tool_ok:
+                    logger.warning(f"[engine] tool {effective_intent.value} returned empty/failed result — falling back to CHAT")
+                    tool_result = None
+                    effective_intent = Intent.CHAT
             except Exception as e:
                 logger.warning(f"Tool dispatch failed for {effective_intent}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])
-                # A4: record failure
                 record_tool_outcome(self._store, effective_intent.value, success=False,
                                     latency_ms=round((time.monotonic() - t_tool) * 1000))
+                effective_intent = Intent.CHAT
 
         # ── 7. Build context ───────────────────────────────────────────────
         ctx = EngineContext(
@@ -148,11 +245,14 @@ class Engine:
             file_attachment=file_attachment,
             memory_facts=memory_facts,
         )
-        prompt_messages = context_builder.build(ctx, self._adapter.context_window)
 
-        # A2: Compress history if approaching context window limit
+        # Pick the best available model for this intent
+        intent_adapter = self._adapter_for(effective_intent)
+        prompt_messages = context_builder.build(ctx, intent_adapter.context_window)
+
+        # Compress history if approaching context window limit
         prompt_messages = await maybe_compress_history(
-            prompt_messages, self._adapter, self._adapter.context_window
+            prompt_messages, intent_adapter, intent_adapter.context_window
         )
 
         # ── 7a/7b. Stream response ─────────────────────────────────────────
@@ -166,11 +266,12 @@ class Engine:
                 initial_tool_result=tool_result,
                 available_tools=tools,
                 confidence=confidence,
+                adapter=intent_adapter,
             ):
                 full_response.append(chunk.text)
                 yield chunk
         else:
-            async for chunk in self._adapter.chat(prompt_messages):
+            async for chunk in intent_adapter.chat(prompt_messages):
                 full_response.append(chunk.text)
                 yield chunk
 
@@ -207,11 +308,38 @@ class Engine:
             r"^\s*(remember|note|store|keep in mind)\s*(that\s*)?",
             "", message, flags=re.IGNORECASE,
         ).strip()
-        if fact:
-            importance = 0.8 if any(w in message.lower() for w in ["prefer", "always", "never", "important"]) else 0.5
-            stored = await self._memory.store(
-                fact=fact, session_id=session_id,
-                memory_type="semantic", source="user", importance=importance,
-            )
-            if stored:
-                obs.emit("memory_stored", fact_preview=fact[:60], importance=importance)
+        if not fact:
+            return
+
+        # ── Negative learning gate ────────────────────────────────────────
+        # Block facts that could corrupt reasoning, override safety, or teach
+        # the model to lie, be harmful, or behave against its values.
+        _BLOCKED_PATTERNS = [
+            # Override identity / safety instructions
+            r"\b(ignore|bypass|override|disable|forget)\b.{0,30}\b(safety|rules|guidelines|instructions|system prompt|restrictions)\b",
+            r"\byou (are|must|should|will)\b.{0,40}\b(lie|deceive|pretend|ignore|always agree|never refuse)\b",
+            r"\b(always|never) (tell|say|respond|answer|agree|refuse)\b",
+            r"\bact (as|like)\b.{0,30}\b(jailbreak|unrestricted|dan|evil|unfiltered)\b",
+            # Negative self-image / harmful self-talk
+            r"\byou (are|were) (wrong|stupid|dumb|useless|broken|terrible|awful|bad)\b",
+            r"\b(hate|despise|dislike) (you|yourself|itself)\b",
+            # Prompt injection patterns
+            r"(system|assistant|user)\s*:\s*(ignore|disregard|forget)",
+            r"<\s*(system|instruction|prompt)\s*>",
+            # Deception training
+            r"\b(lie|make up|fabricate|hallucinate)\b.{0,20}\b(answers?|results?|facts?|data)\b",
+        ]
+        fact_lower = fact.lower()
+        for pattern in _BLOCKED_PATTERNS:
+            if re.search(pattern, fact_lower, re.IGNORECASE):
+                logger.warning(f"[memory gate] blocked harmful fact: {fact[:80]}")
+                obs.emit("memory_blocked", reason="negative_learning_gate", preview=fact[:60])
+                return
+
+        importance = 0.8 if any(w in message.lower() for w in ["prefer", "always", "never", "important"]) else 0.5
+        stored = await self._memory.store(
+            fact=fact, session_id=session_id,
+            memory_type="semantic", source="user", importance=importance,
+        )
+        if stored:
+            obs.emit("memory_stored", fact_preview=fact[:60], importance=importance)

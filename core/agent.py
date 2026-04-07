@@ -19,13 +19,15 @@ from tools import dispatch
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 12
+MAX_ITERATIONS = 6  # was 12 — tighter loop, faster bail-out
 
 AGENT_INTENTS = {
     Intent.WEB_SEARCH,
     Intent.CODE_EXEC,
+    Intent.SHELL,
     Intent.FILE_WRITE,
     Intent.MEMORY_OP,
+    # Intent.SYSINFO intentionally excluded — instant offline tool, no reasoning loop needed
 }
 
 # Confidence threshold below which we ask user to confirm intent
@@ -62,46 +64,45 @@ class AgentTrace:
 
 def _build_agent_system_prompt(intent: Intent, available_tools: list[dict]) -> str:
     tool_list = "\n".join(
-        f"  - {t['intent']}: {t['description']} "
-        f"(latency: {t.get('latency_ms', '?')}ms, cost: {t.get('cost', '?')})"
+        f"  - {t['intent']}: {t['description']}"
         for t in available_tools
     )
-    return f"""You are LocalMind, a reasoning agent running on the user's local machine.
-You reason step by step before acting. After observing a tool result, you reflect on its quality.
+    return f"""You are LocalMind's reasoning agent. You have tools available and MUST use them — never simulate or guess tool results.
 
 Available tools:
 {tool_list}
 
-RESPONSE FORMAT — use ONE of these per iteration:
+STRICT RULES:
+1. To use a tool: output ONLY an <action> block. Nothing else on that iteration.
+2. To deliver your final answer: output ONLY a <finish> block. Nothing else.
+3. NEVER output <reflect> tags in a <finish> block. Reflection is internal only.
+4. NEVER fabricate tool results. If a tool fails, say so in <finish>.
+5. For FILE_WRITE: always use the write_file tool — never just show code in <finish>.
+6. For time/date/specs: use sysinfo tool — never guess or use training data.
+7. After every tool result, decide: is this enough to answer? If yes → <finish>. If no → next <action>.
+
+FORMAT:
 
 Use a tool:
 <action>
-tool: <tool_name>
-input: <what to send to the tool>
+tool: <tool_name_from_list>
+input: <exact input for the tool>
 </action>
 
-Reflect on a tool result (use after observing a result):
-<reflect>
-quality: good|partial|failed
-issue: what was wrong (if partial/failed)
-next: what you will do differently
-</reflect>
-
-Ask user to clarify (ONLY if intent is completely ambiguous):
-<clarify>Your specific question here</clarify>
-
-Deliver final answer (when ready):
+Deliver answer (plain markdown, no XML tags inside):
 <finish>
-Your complete answer in markdown.
+Your complete answer here.
 </finish>
 
-Rules:
-- One tag per iteration — never combine action + finish in same response
-- After a tool FAILS: always output <reflect> then try a different approach
-- After a PARTIAL result: reflect, then either retry with better input or finish with what you have
-- After a GOOD result: proceed to <finish> or next <action>
-- Maximum {MAX_ITERATIONS} iterations total
-- Current primary intent: {intent.value}
+Internal reflection (NEVER shown to user, use sparingly):
+<reflect>
+quality: good|partial|failed
+issue: what went wrong
+next: what to try instead
+</reflect>
+
+Current intent: {intent.value}
+Max iterations: {MAX_ITERATIONS}
 """
 
 
@@ -116,7 +117,9 @@ class AgentLoop:
         initial_tool_result: Optional[ToolResult],
         available_tools: list[dict],
         confidence: float = 1.0,
+        adapter=None,          # specialist adapter for this intent; falls back to self._adapter
     ) -> AsyncIterator[StreamChunk]:
+        _adapter = adapter or self._adapter
         trace = AgentTrace()
 
         # Clarification gate: if confidence is very low, ask before running tools
@@ -170,7 +173,7 @@ class AgentLoop:
             iteration_messages = loop_messages + [{"role": "user", "content": context_msg}]
 
             thought_chunks = []
-            async for chunk in self._adapter.chat(iteration_messages, temperature=0.3):
+            async for chunk in _adapter.chat(iteration_messages, temperature=0.3):
                 thought_chunks.append(chunk.text)
             thought = "".join(thought_chunks)
 
@@ -215,6 +218,12 @@ class AgentLoop:
                     reflection=reflection_text,
                 ))
                 last_tool_failed = "failed" in reflection_text.lower()
+                # Stream a status line so user isn't staring at blank screen
+                quality_line = next(
+                    (l for l in reflection_text.splitlines() if "quality:" in l.lower()), ""
+                )
+                if quality_line:
+                    yield StreamChunk(text=f"\n_[Thinking: {quality_line.strip()}]_\n", done=False)
                 continue
 
             # ── Action ───────────────────────────────────────────────────────
@@ -223,6 +232,8 @@ class AgentLoop:
                 tool_name = action_match.group(1).strip()
                 tool_input = action_match.group(2).strip()
                 logger.info(f"[agent] iter={iteration+1} tool={tool_name} input={tool_input[:80]}")
+                # Stream a status line so user knows what's happening
+                yield StreamChunk(text=f"\n_[Using {tool_name}: {tool_input[:60]}{'…' if len(tool_input) > 60 else ''}]_\n", done=False)
 
                 tool_failed = False
                 try:
@@ -275,5 +286,5 @@ class AgentLoop:
                 "based on everything gathered so far."
             )
         }]
-        async for chunk in self._adapter.chat(force_msg, temperature=0.4):
+        async for chunk in _adapter.chat(force_msg, temperature=0.4):
             yield chunk
