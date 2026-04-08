@@ -108,8 +108,37 @@ async def shell_exec(message: str) -> ToolResult:
     timeout = getattr(settings, "localmind_code_exec_timeout", 30)
     risk = _classify_risk(command)
 
-    # Lock working directory to project root
-    cwd = str(Path(getattr(settings, "localmind_db_path", "./localmind.db")).parent.resolve())
+    # Determine working directory - allow user directories and project root
+    import os
+    from pathlib import Path
+    
+    # Get user home directory
+    if os.name == 'nt':  # Windows
+        user_home = Path(os.environ.get('USERPROFILE', os.environ.get('HOME', 'C:\\Users')))
+    else:  # Unix/Mac
+        user_home = Path(os.environ.get('HOME', '/home/user'))
+    
+    # Default to user home, but allow commands to specify paths
+    cwd = user_home
+    
+    # Extract directory path from commands like "list C:\Users\username\Documents" or "ls ~/Documents"
+    if os.name == 'nt':  # Windows
+        import re
+        # Match patterns like "list C:\Users\username\Documents" or "dir C:\Users\username"
+        path_match = re.search(r'\b(list|dir|ls)\s+([A-Z]:[\\/][^\\s]+)', command, re.IGNORECASE)
+        if path_match:
+            target_path = Path(path_match.group(2))
+            if target_path.exists() and (target_path.is_relative_to(user_home) or target_path.parent == user_home.parent):
+                cwd = target_path.parent
+    else:  # Unix/Mac
+        # Match patterns like "ls ~/Documents" or "list /home/user/Documents"
+        import re
+        path_match = re.search(r'\b(list|ls|dir)\s+([/~][^\s]+)', command)
+        if path_match:
+            path_str = path_match.group(2).replace('~', str(user_home))
+            target_path = Path(path_str)
+            if target_path.exists() and target_path.is_relative_to(user_home):
+                cwd = target_path
 
     try:
         # Use shell=True so pipes, redirects work — but we've already blocked dangerous patterns

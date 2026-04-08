@@ -33,13 +33,11 @@ async def _search_ddg(query: str) -> list[dict]:
 async def _search_brave(query: str, api_key: str) -> list[dict]:
     try:
         import httpx
-        # Pass plain string — httpx encodes params correctly.
-        # Do NOT manually urllib.parse.quote then also pass via params (double-encode).
-        safe_query = query.encode("utf-8", errors="replace").decode("utf-8")
+        # Pass query directly as string - httpx handles UTF-8 encoding automatically
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
-                params={"q": safe_query, "count": MAX_RESULTS},
+                params={"q": query, "count": MAX_RESULTS},
                 headers={"Accept": "application/json", "X-Subscription-Token": api_key},
             )
             r.raise_for_status()
@@ -49,8 +47,7 @@ async def _search_brave(query: str, api_key: str) -> list[dict]:
                 for w in data.get("web", {}).get("results", [])
             ]
     except Exception as e:
-        error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
-        logger.warning(f"[web_search] Brave failed: {error_msg}")
+        logger.warning(f"[web_search] Brave failed: {e}")
         return []
 
 

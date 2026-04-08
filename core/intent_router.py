@@ -95,6 +95,7 @@ _SHELL_PATTERNS = [
     r"\b(read|show|open)\b.{0,30}\bsource\b",
     r"\b(fix|modify|edit|update|patch)\b.{0,30}\b(yourself|itself|your own|source|code)\b",
     r"\b(what('?s| is) in|show me|print)\b.{0,20}\b\w+\.(py|js|ts|yaml|yml|toml|env)\b",
+    r"\b(list|show|ls|dir)\b.{0,30}\b(dir|directory|folder|files)\b",
 ]
 
 _CODE_PATTERNS = [

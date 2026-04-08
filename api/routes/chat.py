@@ -18,9 +18,10 @@ import uuid
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import Optional
+from contextlib import asynccontextmanager
 
 from core.engine import Engine
 from core.obs import ObsCollector
@@ -46,6 +47,7 @@ async def _event_stream(
     content_type=None,
     file_full_path=None,   # full path sent by UI if available
     original_path=None,    # original file location
+    disconnect=None,
 ):
     obs = ObsCollector()
     intent_emitted = False
@@ -63,6 +65,10 @@ async def _event_stream(
             obs=obs,
             original_path=original_path,
         ):
+            # Check if client disconnected
+            if disconnect and await disconnect():
+                logger.info(f"Client disconnected, stopping stream for session {session_id}")
+                break
             # Flush any buffered obs events before each text chunk
             for evt in obs.drain():
                 yield _sse(evt.to_sse_dict())
@@ -160,6 +166,7 @@ async def _event_stream(
 
 @router.post("/chat")
 async def chat(
+    request: Request,
     message: str = Form(...),
     session_id: str = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
@@ -199,7 +206,10 @@ async def chat(
             file_full_path = str(dest)
 
     return StreamingResponse(
-        _event_stream(message, sid, file_bytes, filename, file_content_type, file_full_path, original_path),
+        _event_stream(
+            message, sid, file_bytes, filename, file_content_type, file_full_path, original_path,
+            disconnect=request.is_disconnected
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

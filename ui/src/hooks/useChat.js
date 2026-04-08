@@ -1,5 +1,5 @@
-import { useState, useCallback, useRef } from 'react'
-import { streamChat, newSessionId } from '../lib/api'
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { streamChat, newSessionId, fetchHistory } from '../lib/api'
 
 /**
  * useChat — manages all chat state and streaming.
@@ -22,6 +22,30 @@ export function useChat(initialSessionId) {
   const [error, setError] = useState(null)
   const [file, setFile] = useState(null)
   const [observabilityData, setObservabilityData] = useState({})
+
+  // Load history when session ID changes
+  useEffect(() => {
+    const loadHistory = async () => {
+      if (sessionId) {
+        try {
+          const history = await fetchHistory(sessionId)
+          setMessages(history.map((msg, index) => ({
+            id: index,
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp
+          })))
+        } catch (err) {
+          console.error('Failed to load history:', err)
+          setMessages([])
+        }
+      } else {
+        setMessages([])
+      }
+    }
+
+    loadHistory()
+  }, [sessionId])
 
   const abortRef = useRef(null)
   const streamingIdRef = useRef(null)
@@ -50,49 +74,47 @@ export function useChat(initialSessionId) {
         sessionId,
         file: currentFile,
         onChunk: (chunk) => {
-          // Handle different types of SSE events
-          if (chunk.text) {
-            // Text chunk for message content
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === streamingIdRef.current
-                  ? { ...m, content: m.content + chunk.text, pending: true }
-                  : m
-              )
+          // Text chunk for message content
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamingIdRef.current
+                ? { ...m, content: m.content + chunk, pending: true }
+                : m
             )
-          } else if (chunk.intent) {
-            // Intent classification event
-            setObservabilityData(prev => ({
-              ...prev,
-              intent: chunk.intent,
-              confidence: chunk.confidence
-            }))
-          } else if (chunk.obs_event) {
-            // Other observability events
-            const event = chunk.obs_event
-            setObservabilityData(prev => {
-              const updated = { ...prev }
-              
-              switch (event.type) {
-                case 'tool_dispatched':
-                  updated.toolCalls = [...(prev.toolCalls || []), {
-                    name: event.data.tool,
-                    success: event.data.success,
-                    latency: event.data.latency_ms
-                  }]
-                  break
-                case 'memory_retrieved':
-                  updated.memoryHits = event.data.facts || []
-                  break
-                case 'turn_complete':
-                  updated.latency = event.data.total_latency_ms
-                  updated.tokens = event.data.tokens_approx
-                  break
-              }
-              
-              return updated
-            })
-          }
+          )
+        },
+        onIntent: (intentData) => {
+          // Intent classification event
+          setObservabilityData(prev => ({
+            ...prev,
+            intent: intentData.intent,
+            confidence: intentData.confidence
+          }))
+        },
+        onObsEvent: (event) => {
+          // Other observability events
+          setObservabilityData(prev => {
+            const updated = { ...prev }
+            
+            switch (event.type) {
+              case 'tool_dispatched':
+                updated.toolCalls = [...(prev.toolCalls || []), {
+                  name: event.data.tool,
+                  success: event.data.success,
+                  latency: event.data.latency_ms
+                }]
+                break
+              case 'memory_retrieved':
+                updated.memoryHits = event.data.facts || []
+                break
+              case 'turn_complete':
+                updated.latency = event.data.total_latency_ms
+                updated.tokens = event.data.tokens_approx
+                break
+            }
+            
+            return updated
+          })
         },
         onError: (err) => {
           setError(err)
@@ -112,6 +134,7 @@ export function useChat(initialSessionId) {
           )
           setIsStreaming(false)
           streamingIdRef.current = null
+          abortRef.current = null
         },
       })
 
@@ -123,11 +146,13 @@ export function useChat(initialSessionId) {
   const reset = useCallback(() => {
     if (abortRef.current) abortRef.current()
     setMessages([])
-    setSessionId(newSessionId())
+    const newId = newSessionId()
+    setSessionId(newId)
     setIsStreaming(false)
     setError(null)
     setFile(null)
     setObservabilityData({})
+    return newId
   }, [])
 
   const cancelStream = useCallback(() => {

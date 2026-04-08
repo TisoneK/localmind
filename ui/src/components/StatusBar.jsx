@@ -1,4 +1,5 @@
 import { useHealth } from '../hooks/useHealth'
+import { useSession } from '../hooks/useSession'
 
 const S = {
   bar: {
@@ -41,10 +42,14 @@ const S = {
 
 export function StatusBar({ onNewChat, sessionId }) {
   const { health, loading } = useHealth()
+  const { getSessionTitle } = useSession()
 
   const ok = health?.ollama_reachable === true
-  const model = health?.model || '—'
-  const status = loading ? 'connecting…' : ok ? 'connected' : 'Ollama offline'
+  const model = health?.model || '---'
+  const status = loading ? 'connecting...' : ok ? 'connected' : 'Ollama offline'
+  
+  const sessionTitle = sessionId ? getSessionTitle(sessionId) : null
+  const displayTitle = sessionTitle || (sessionId ? `#${sessionId.slice(0, 8)}` : null)
 
   return (
     <div style={S.bar}>
@@ -52,9 +57,9 @@ export function StatusBar({ onNewChat, sessionId }) {
       <span style={S.label}>{status}</span>
       {ok && <span style={S.model}>{model}</span>}
       <div style={S.spacer} />
-      {sessionId && (
+      {displayTitle && (
         <span title={`Session: ${sessionId}`}>
-          #{sessionId.slice(0, 8)}
+          {displayTitle}
         </span>
       )}
       <button style={S.newBtn} onClick={onNewChat} title="Start a new conversation">
