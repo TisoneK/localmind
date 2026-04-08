@@ -72,11 +72,11 @@ const S = {
     fontSize: '10px',
     padding: '2px 6px',
     borderRadius: '3px',
-    opacity: 0.4,
+    opacity: 0,
     transition: 'opacity 0.15s',
   },
   sessionItemHovering: {
-    opacity: 1,
+    opacity: 0.7,
   },
   empty: {
     padding: '20px',
