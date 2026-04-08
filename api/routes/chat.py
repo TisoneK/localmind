@@ -25,6 +25,7 @@ from typing import Optional
 from core.engine import Engine
 from core.obs import ObsCollector
 from core.config import settings
+from core.title_generator import generate_title_smart, should_generate_title, refine_title_async
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ async def _event_stream(
     intent_emitted = False
     file_path_written = None
     file_name_written = None
+    captured_intent = None
 
     try:
         async for chunk in _engine.process(
@@ -66,6 +68,32 @@ async def _event_stream(
                 yield _sse(evt.to_sse_dict())
                 if evt.type == "intent_classified" and not intent_emitted:
                     intent_emitted = True
+                    captured_intent = evt.data.get("primary")
+                    
+                    # Update title with intent-aware generation
+                    try:
+                        from storage.db import SessionStore
+                        store = SessionStore(settings.localmind_db_path)
+                        current_title = store.get_session_title(session_id)
+                        
+                        # Always update if we have a better smart title
+                        smart_title = generate_title_smart(message, captured_intent)
+                        
+                        # Only update if different or if current title looks like truncation
+                        should_update = (
+                            not current_title or 
+                            current_title == "New Chat" or
+                            len(current_title) > 35 or  # Likely truncated
+                            current_title.endswith("...") or  # Truncated
+                            current_title != smart_title
+                        )
+                        
+                        if should_update:
+                            store.update_session_title(session_id, smart_title)
+                            logger.info(f"INTENT-AWARE UPDATE: {captured_intent} -> '{smart_title}' (replaced: '{current_title}')")
+                    except Exception as e:
+                        logger.warning(f"Failed to update title with intent: {e}")
+                    
                     yield _sse({
                         "intent": evt.data.get("primary"),
                         "confidence": float(evt.data.get("confidence", 0.5)),
@@ -104,6 +132,27 @@ async def _event_stream(
         for evt in obs.drain():
             yield _sse(evt.to_sse_dict())
 
+        # Fallback: If no intent was classified, still generate smart title
+        if not intent_emitted:
+            try:
+                from storage.db import SessionStore
+                store = SessionStore(settings.localmind_db_path)
+                current_title = store.get_session_title(session_id)
+                
+                should_update = (
+                    not current_title or 
+                    current_title == "New Chat" or
+                    len(current_title) > 35 or
+                    current_title.endswith("...")
+                )
+                
+                if should_update:
+                    smart_title = generate_title_smart(message, None)  # No intent available
+                    store.update_session_title(session_id, smart_title)
+                    logger.info(f"FALLBACK TITLE UPDATE: '{smart_title}' (replaced: '{current_title}')")
+            except Exception as e:
+                logger.warning(f"Failed to update fallback title: {e}")
+
     except Exception as e:
         logger.error(f"Stream error: {e}", exc_info=True)
         yield _sse({"error": str(e), "done": True})
@@ -123,6 +172,9 @@ async def chat(
     logger.info(f"File full path: {file_full_path}")
     
     sid = session_id or str(uuid.uuid4())
+
+    # 🔥 Title generation will happen during intent classification in the event stream
+    # This ensures we have access to the detected intent for smart title generation
 
     file_bytes = None
     filename = None

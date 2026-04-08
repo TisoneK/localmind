@@ -127,9 +127,10 @@ class SessionStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT s.id, s.created_at,
+                SELECT s.id, s.created_at, s.title,
                        COUNT(m.id) AS message_count,
-                       MAX(m.timestamp) AS last_active
+                       MAX(m.timestamp) AS last_active,
+                       MIN(m.content) AS first_message
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.id
                 GROUP BY s.id
@@ -137,6 +138,23 @@ class SessionStore:
                 """,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_session_title(self, session_id: str) -> str | None:
+        """Get current session title."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT title FROM sessions WHERE id = ?",
+                (session_id,)
+            ).fetchone()
+            return row["title"] if row else None
+
+    def update_session_title(self, session_id: str, title: str) -> None:
+        """Update session title."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id)
+            )
 
     def delete_session(self, session_id: str) -> bool:
         with self._conn() as conn:

@@ -15,12 +15,31 @@ class SessionListItem(BaseModel):
     created_at: float
     message_count: int
     last_active: float | None
+    title: str | None
+
+
+def resolve_title(session: dict) -> str:
+    """Generate fallback title if session has no title."""
+    if session.get("title"):
+        return session["title"]
+    
+    # Try to get first message as fallback
+    if session.get("first_message"):
+        return session["first_message"][:40] + ("..." if len(session["first_message"]) > 40 else "")
+    
+    return "New Chat"
 
 
 @router.get("/sessions", response_model=list[SessionListItem])
 async def list_sessions():
     """List all conversation sessions."""
-    return _store.list_sessions()
+    sessions = _store.list_sessions()
+    
+    # Add resolved titles to each session
+    for session in sessions:
+        session["title"] = resolve_title(session)
+    
+    return sessions
 
 
 @router.get("/sessions/{session_id}/history")
