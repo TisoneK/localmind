@@ -433,24 +433,30 @@ class AgentLoop:
                         # For web search, write results to file and finish immediately to bypass LLM synthesis
                         if tool_intent == Intent.WEB_SEARCH:
                             filename = f"search_results_{int(time.time())}.md"
+                            file_content = f"# Web Search Results: {tool_input}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n{safe_obs}"
                             try:
-                                with open(filename, 'w', encoding='utf-8') as f:
-                                    f.write(f"# Web Search Results: {tool_input}\n\n")
-                                    f.write(f"*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-                                    f.write(safe_obs)
+                                # Use the file_write tool for consistency
+                                from tools import dispatch
+                                file_result, file_failed, file_retry = await _dispatch_with_retry(
+                                    Intent.FILE_WRITE, f"{filename}:{file_content}"
+                                )
                                 
-                                logger.info(f"[agent] Web search results written to {filename}")
-                                final_response = f"Web search completed! Results saved to `{filename}`\n\nKey findings:\n{_truncate_web_search_results(safe_obs)}"
-                                trace.final_response = final_response
-                                trace.steps.append(AgentStep(
-                                    iteration=iteration + 1, thought=thought,
-                                    tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}",
-                                ))
-                                yield StreamChunk(text=final_response, done=False)
-                                yield StreamChunk(text="", done=True)
-                                return
+                                if not file_failed and file_result:
+                                    logger.info(f"[agent] Web search results written to {filename} using file_write tool")
+                                    final_response = f"Web search completed! Results saved to `{filename}`\n\nKey findings:\n{_truncate_web_search_results(safe_obs)}"
+                                    trace.final_response = final_response
+                                    trace.steps.append(AgentStep(
+                                        iteration=iteration + 1, thought=thought,
+                                        tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}",
+                                    ))
+                                    yield StreamChunk(text=final_response, done=False)
+                                    yield StreamChunk(text="", done=True)
+                                    return
+                                else:
+                                    logger.error(f"[agent] file_write tool failed: {file_result}")
+                                    raise Exception("File write tool failed")
                             except Exception as e:
-                                logger.error(f"[agent] Failed to write search results to file: {e}")
+                                logger.error(f"[agent] Failed to write search results using file_write tool: {e}")
                                 # Fall back to normal processing if file write fails
                         
                         observation = safe_obs
