@@ -3,6 +3,7 @@ import { StatusBar } from './components/StatusBar'
 import { MessageList } from './components/MessageList'
 import { ChatInput } from './components/ChatInput'
 import { ErrorBanner } from './components/ErrorBanner'
+import { ObservabilityPanel } from './components/ObservabilityPanel'
 import { useChat } from './hooks/useChat'
 
 const S = {
@@ -26,20 +27,26 @@ export default function App() {
     send,
     reset,
     cancelStream,
+    observabilityData,
   } = useChat()
 
   return (
     <div style={S.root}>
       <StatusBar onNewChat={reset} sessionId={sessionId} />
       <ErrorBanner error={error} onDismiss={() => {}} />
-      <MessageList messages={messages} />
-      <ChatInput
-        onSend={send}
-        isStreaming={isStreaming}
-        onStop={cancelStream}
-        file={file}
-        onFile={setFile}
-      />
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <MessageList messages={messages} />
+          <ChatInput
+            onSend={send}
+            isStreaming={isStreaming}
+            onStop={cancelStream}
+            file={file}
+            onFile={setFile}
+          />
+        </div>
+        <ObservabilityPanel observabilityData={observabilityData} />
+      </div>
     </div>
   )
 }

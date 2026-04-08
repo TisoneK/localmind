@@ -37,7 +37,7 @@ const S = {
     height: '34px',
     borderRadius: '8px',
     border: 'none',
-    background: active ? '#4f46e5' : '#2a2a3e',
+    background: active ? '#22c55e' : '#2a2a3e',
     color: active ? '#fff' : '#55556a',
     cursor: active ? 'pointer' : 'default',
     display: 'flex',

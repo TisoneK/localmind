@@ -64,6 +64,7 @@ localmind_output/
 node_modules/
 ui/dist/
 ui/.vite/
+ui/src/lib/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

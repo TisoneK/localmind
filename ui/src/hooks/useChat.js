@@ -13,13 +13,15 @@ import { streamChat, newSessionId } from '../lib/api'
  *   setFile      - setter for file
  *   send         - function(messageText) → starts a stream
  *   reset        - clears messages and starts a new session
+ *   observabilityData - observability data
  */
 export function useChat(initialSessionId) {
   const [messages, setMessages] = useState([])
-  const [sessionId, setSessionId] = useState(initialSessionId || newSessionId)
+  const [sessionId, setSessionId] = useState(initialSessionId || newSessionId())
   const [isStreaming, setIsStreaming] = useState(false)
   const [error, setError] = useState(null)
   const [file, setFile] = useState(null)
+  const [observabilityData, setObservabilityData] = useState({})
 
   const abortRef = useRef(null)
   const streamingIdRef = useRef(null)
@@ -29,6 +31,7 @@ export function useChat(initialSessionId) {
       if (!text.trim() || isStreaming) return
 
       setError(null)
+      setObservabilityData({}) // Reset observability for new message
 
       // Add user message immediately
       const userMsg = { id: Date.now(), role: 'user', content: text, file: file?.name }
@@ -46,14 +49,50 @@ export function useChat(initialSessionId) {
         message: text,
         sessionId,
         file: currentFile,
-        onChunk: (token) => {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === streamingIdRef.current
-                ? { ...m, content: m.content + token, pending: true }
-                : m
+        onChunk: (chunk) => {
+          // Handle different types of SSE events
+          if (chunk.text) {
+            // Text chunk for message content
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === streamingIdRef.current
+                  ? { ...m, content: m.content + chunk.text, pending: true }
+                  : m
+              )
             )
-          )
+          } else if (chunk.intent) {
+            // Intent classification event
+            setObservabilityData(prev => ({
+              ...prev,
+              intent: chunk.intent,
+              confidence: chunk.confidence
+            }))
+          } else if (chunk.obs_event) {
+            // Other observability events
+            const event = chunk.obs_event
+            setObservabilityData(prev => {
+              const updated = { ...prev }
+              
+              switch (event.type) {
+                case 'tool_dispatched':
+                  updated.toolCalls = [...(prev.toolCalls || []), {
+                    name: event.data.tool,
+                    success: event.data.success,
+                    latency: event.data.latency_ms
+                  }]
+                  break
+                case 'memory_retrieved':
+                  updated.memoryHits = event.data.facts || []
+                  break
+                case 'turn_complete':
+                  updated.latency = event.data.total_latency_ms
+                  updated.tokens = event.data.tokens_approx
+                  break
+              }
+              
+              return updated
+            })
+          }
         },
         onError: (err) => {
           setError(err)
@@ -88,6 +127,7 @@ export function useChat(initialSessionId) {
     setIsStreaming(false)
     setError(null)
     setFile(null)
+    setObservabilityData({})
   }, [])
 
   const cancelStream = useCallback(() => {
@@ -102,5 +142,5 @@ export function useChat(initialSessionId) {
     }
   }, [])
 
-  return { messages, sessionId, isStreaming, error, file, setFile, send, reset, cancelStream }
+  return { messages, sessionId, isStreaming, error, file, setFile, send, reset, cancelStream, observabilityData }
 }

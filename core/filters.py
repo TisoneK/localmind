@@ -50,7 +50,7 @@ def _filter_system_leaks(text: str) -> str:
     # Collapse runs of blank lines left by removal (max 2 consecutive)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
 
-    return cleaned.strip()
+    return cleaned
 
 
 # ── Tool injection filter ─────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ def _filter_tool_injection(text: str, is_code_output: bool = False) -> str:
     # Instruction override phrases
     text = _INJECTION_PHRASES.sub("[filtered]", text)
 
-    return text.strip()
+    return text
 
 
 def _filter_code_output(text: str) -> str:

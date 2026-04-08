@@ -28,13 +28,14 @@ const S = {
   },
   spacer: { flex: 1 },
   newBtn: {
-    background: 'none',
-    border: '1px solid #2a2a3e',
+    background: '#22c55e',
+    border: '1px solid #22c55e',
     borderRadius: '6px',
-    color: '#6b6b7a',
+    color: '#ffffff',
     fontSize: '11px',
     padding: '3px 8px',
     cursor: 'pointer',
+    fontWeight: '500',
   },
 }
 

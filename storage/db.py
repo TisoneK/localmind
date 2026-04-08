@@ -130,7 +130,9 @@ class SessionStore:
                 SELECT s.id, s.created_at, s.title,
                        COUNT(m.id) AS message_count,
                        MAX(m.timestamp) AS last_active,
-                       MIN(m.content) AS first_message
+                       (SELECT m_first.content FROM messages m_first 
+                         WHERE m_first.session_id = s.id AND m_first.role = 'user' 
+                         ORDER BY m_first.timestamp ASC LIMIT 1) AS first_message
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.id
                 GROUP BY s.id
