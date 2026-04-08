@@ -1373,11 +1373,18 @@ function handleFile(input) {
 }
 
 function clearFile() {
+  console.log('clearFile() called - clearing file preview');
   pendingFileBytes = null;
   pendingFileName = null;
   pendingFilePath = null;
   document.getElementById('file-input').value = '';
-  document.getElementById('file-preview').classList.remove('visible');
+  const previewEl = document.getElementById('file-preview');
+  if (previewEl) {
+    previewEl.classList.remove('visible');
+    console.log('File preview cleared');
+  } else {
+    console.log('File preview element not found');
+  }
 }
 
 // F6: Drag-and-drop
@@ -1470,6 +1477,16 @@ async function sendMessage() {
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
   if (!text) return;
+  
+  // Wait for file to finish loading if present
+  if (pendingFileName && !pendingFileBytes) {
+    // File is still loading, wait a bit
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!pendingFileBytes) {
+      alert('File still loading, please try again.');
+      return;
+    }
+  }
 
   if (!currentSessionId) {
     currentSessionId = generateId();
@@ -1524,13 +1541,40 @@ async function sendMessage() {
   formData.append('session_id', currentSessionId);
 
   if (pendingFileBytes && pendingFileName) {
-    formData.append('file', new Blob([pendingFileBytes]), pendingFileName);
-    if (pendingFilePath) formData.append('file_full_path', pendingFilePath);
-    clearFile();
+    console.log('Uploading file:', pendingFileName, 'bytes:', pendingFileBytes.byteLength);
+    // Try creating a File object instead of Blob for better FastAPI compatibility
+    let fileObj;
+    try {
+      fileObj = new File([pendingFileBytes], pendingFileName, { type: 'application/octet-stream' });
+      console.log('Created File object:', fileObj);
+    } catch (e) {
+      console.log('Failed to create File object, falling back to Blob:', e);
+      fileObj = new Blob([pendingFileBytes], { type: 'application/octet-stream' });
+    }
+    formData.append('file', fileObj, pendingFileName);
+    // Send original file path for in-place processing
+    if (pendingFilePath) {
+      formData.append('original_path', pendingFilePath);
+      console.log('Added original_path:', pendingFilePath);
+    }
+    console.log('FormData entries after adding file:');
+    for (let [key, value] of formData.entries()) {
+      if (value instanceof File) {
+        console.log('  ', key, value.name, value.size, 'bytes');
+      } else if (value instanceof Blob) {
+        console.log('  ', key, 'Blob', value.size, 'bytes');
+      } else {
+        console.log('  ', key, value);
+      }
+    }
   }
 
   try {
-    const response = await fetch(`${API}/api/chat`, { method: 'POST', body: formData });
+    const response = await fetch(`${API}/api/chat`, { 
+      method: 'POST', 
+      body: formData,
+      // Don't set Content-Type header - browser will set it correctly for FormData
+    });
 
     if (!response.ok) {
       if (statusEl && statusEl._timerInterval) {
@@ -1538,6 +1582,8 @@ async function sendMessage() {
       }
       statusEl?.remove();
       contentEl.innerHTML = `Error ${response.status}: ${await response.text()}`;
+      // Clear file on error
+      if (pendingFileBytes && pendingFileName) clearFile();
       return;
     }
 
@@ -1555,31 +1601,43 @@ async function sendMessage() {
       const lines = decoder.decode(value).split('\n');
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
+        let data;
         try {
-          const data = JSON.parse(line.slice(6));
-          if (data.error) {
-            contentEl.innerHTML = `<em style="color:var(--red)">Error: ${escHtml(data.error)}</em>`;
-            if (statusEl && statusEl._timerInterval) {
-              clearInterval(statusEl._timerInterval);
-            }
-            statusEl?.remove();
-            break outer;
+          data = JSON.parse(line.slice(6));
+        } catch(parseError) {
+          console.error('JSON parse error:', parseError);
+          continue;
+        }
+        
+        if (data.error) {
+          contentEl.innerHTML = `<em style="color:var(--red)">Error: ${escHtml(data.error)}</em>`;
+          if (statusEl && statusEl._timerInterval) {
+            clearInterval(statusEl._timerInterval);
           }
+          statusEl?.remove();
+          break outer;
+        }
+          
           // F2: update status from obs events
           if (data.obs_event) {
+            console.log('Received obs_event:', data.obs_event);
             addObsEvent(data.obs_event);
+            const evt = data.obs_event;
+            const textEl = statusEl?.querySelector('.status-text');
+            const detailsEl = statusEl?.querySelector('.status-details');
+            if (evt.type === 'tool_dispatched') {
+              if (textEl) textEl.textContent = toolStatusLabel[evt.data?.tool] || 'Working…';
+              if (detailsEl) detailsEl.textContent = `Tool: ${evt.data?.tool}`;
+            } else if (evt.type === 'agent_loop_start') {
+              if (textEl) textEl.textContent = 'Reasoning…';
+              if (detailsEl) detailsEl.textContent = 'Agent loop started';
+            } else if (evt.type === 'safety_blocked') {
+              if (textEl) textEl.textContent = 'Blocked';
+            }
             if (!firstToken) {
-              const evt = data.obs_event;
-              const textEl = statusEl?.querySelector('.status-text');
-              const detailsEl = statusEl?.querySelector('.status-details');
-              if (evt.type === 'tool_dispatched') {
-                if (textEl) textEl.textContent = toolStatusLabel[evt.data?.tool] || 'Working…';
-                if (detailsEl) detailsEl.textContent = `Tool: ${evt.data?.tool}`;
-              } else if (evt.type === 'agent_loop_start') {
-                if (textEl) textEl.textContent = 'Reasoning…';
-                if (detailsEl) detailsEl.textContent = 'Agent loop started';
-              } else if (evt.type === 'safety_blocked') {
-                if (textEl) textEl.textContent = 'Blocked';
+              // Only update intent/confidence pills before first real content
+              if (evt.type === 'intent_classified') {
+                updateSessionPills(evt.data?.primary, evt.data?.confidence);
               }
             }
             // Permission gate — render confirm/deny UI
@@ -1598,53 +1656,79 @@ async function sendMessage() {
             }
           }
           if (data.text) {
-            // Filter out internal agent status lines before first real content
+            // Filter out internal agent status lines completely from user content
             const isStatusLine = data.text.match(/^[\n\r]*_\[(?:Thinking|Using)[^\]]*\]_[\n\r]*$/);
             if (isStatusLine) {
-              // Show as thinking indicator, not in main content
-              const textEl = statusEl?.querySelector('.status-text');
-              if (textEl && !firstToken) {
-                const label = data.text.replace(/_\[|\]_/g, '').trim();
-                textEl.textContent = label.substring(0, 60);
-              }
-            } else {
-              if (!firstToken) {
-                firstToken = true;
-                if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
-                statusEl?.remove();
-              }
-              rawText += data.text;
-              contentEl.innerHTML = renderMarkdown(rawText);
-              scrollToBottom();
+              // Skip internal status lines entirely - don't add to content
+              continue;
             }
+            if (!firstToken) {
+              firstToken = true;
+              if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
+              // Transform status to show "Processing..." instead of removing
+              const textEl = statusEl?.querySelector('.status-text');
+              const detailsEl = statusEl?.querySelector('.status-details');
+              if (textEl) {
+                textEl.textContent = 'Processing...';
+                textEl.style.color = 'var(--text2)';
+              }
+              if (detailsEl) detailsEl.textContent = 'Generating response';
+            }
+            rawText += data.text;
+            contentEl.innerHTML = renderMarkdown(rawText);
+            scrollToBottom();
           }
           if (data.intent) updateSessionPills(data.intent, data.confidence);
           if (data.memory_facts) showMemoryChips(row, data.memory_facts);
-          if (data.done) {
-            if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
-            statusEl?.remove();
-            finalizeMessageTime(row);
-            if (!rawText) {
-              contentEl.innerHTML = '<em style="color:var(--text3)">⚠ No response — check Ollama is running.</em>';
-            }
-            if (agentTrace) renderAgentTrace(row, agentTrace);
-            addMessageToolbar(row, rawText);
-            // Render file links from tool metadata
-            if (data.file_path) renderFileLink(row, data.file_path, data.file_name);
-            await loadSessions();
-            break outer;
-          }
-        } catch(e) { /* skip malformed */ }
-      }
-    }
-    streamReader = null;
-  } catch(e) {
+           if (data.done) {
+             console.log('Response completed - checking file clearing logic');
+             if (statusEl && statusEl._timerInterval) clearInterval(statusEl._timerInterval);
+             // Transform status to completion summary instead of removing
+             const textEl = statusEl?.querySelector('.status-text');
+             const detailsEl = statusEl?.querySelector('.status-details');
+             if (textEl) {
+               const elapsed = Math.floor((Date.now() - startTime) / 1000);
+               textEl.textContent = `Done (${elapsed}s)`;
+               textEl.style.color = 'var(--accent)';
+             }
+             if (detailsEl) detailsEl.textContent = 'Complete';
+             finalizeMessageTime(row);
+             if (!rawText) {
+               contentEl.innerHTML = '<em style="color:var(--text3)">⚠ No response — check Ollama is running.</em>';
+             }
+             if (agentTrace) renderAgentTrace(row, agentTrace);
+             addMessageToolbar(row, rawText);
+             // Render file links from tool metadata
+             if (data.file_path) renderFileLink(row, data.file_path, data.file_name);
+             // Clear file after successful processing
+             console.log('About to clear file - pendingFileBytes:', !!pendingFileBytes, 'pendingFileName:', !!pendingFileName);
+             if (pendingFileBytes && pendingFileName) {
+               console.log('Calling clearFile()');
+               clearFile();
+             } else {
+               console.log('Not clearing file - no file data present');
+             }
+             
+             // Also clear file on first text chunk to ensure UI is responsive
+             if (data.text && !firstToken && pendingFileBytes && pendingFileName) {
+               console.log('Clearing file on first text chunk');
+               clearFile();
+             }
+             await loadSessions();
+             break outer;
+           }
+           }
+       }
+     streamReader = null;
+   } catch(e) {
     if (e.name !== 'AbortError') {
       if (statusEl && statusEl._timerInterval) {
         clearInterval(statusEl._timerInterval);
       }
       statusEl?.remove();
       contentEl.innerHTML = `Connection error: ${e.message}`;
+      // Clear file on connection error
+      if (pendingFileBytes && pendingFileName) clearFile();
     }
   } finally {
     setStreamingState(false);

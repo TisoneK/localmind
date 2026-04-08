@@ -22,7 +22,7 @@ from typing import AsyncIterator, Optional
 
 from core.models import (
     Intent, Message, Role, EngineContext, StreamChunk,
-    FileAttachment, ToolResult,
+    FileAttachment, ToolResult, RiskLevel,
 )
 from core.config import settings
 from core import context_builder
@@ -89,6 +89,7 @@ class Engine:
         filename: Optional[str] = None,
         content_type: Optional[str] = None,
         obs: Optional[ObsCollector] = None,
+        original_path: Optional[str] = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Process a user message end-to-end and stream chunks.
@@ -176,6 +177,7 @@ class Engine:
                 filename=filename,
                 content_type=content_type or "application/octet-stream",
                 chunk_size=settings.localmind_chunk_size_tokens,
+                original_path=original_path,  # Pass original path for in-place processing
             )
 
         # ── 5. Memory retrieval ────────────────────────────────────────────
@@ -225,9 +227,17 @@ class Engine:
                 record_tool_outcome(self._store, effective_intent.value, success=tool_ok,
                                     latency_ms=round((time.monotonic() - t_tool) * 1000))
                 if not tool_ok:
-                    logger.warning(f"[engine] tool {effective_intent.value} returned empty/failed result — falling back to CHAT")
-                    tool_result = None
-                    effective_intent = Intent.CHAT
+                    logger.warning(f"[engine] tool {effective_intent.value} returned empty/failed result - using error fallback")
+                    # For web search failures, provide a clear error message instead of hallucinating
+                    if effective_intent == Intent.WEB_SEARCH:
+                        tool_result = ToolResult(
+                            content="I'm unable to search the web right now. This could be due to:\n- No internet connection\n- Search service temporarily unavailable\n- DuckDuckGo/Brave API issues\n\nPlease try again later or check your internet connection.",
+                            risk=RiskLevel.LOW,
+                            source="web_search_error"
+                        )
+                    else:
+                        tool_result = None
+                        effective_intent = Intent.CHAT
             except Exception as e:
                 logger.warning(f"Tool dispatch failed for {effective_intent}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])

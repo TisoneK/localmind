@@ -26,13 +26,14 @@ _FILE_PATTERNS = [
 
 # v0.2: tightened to reduce false positives on "what is X" questions
 _SEARCH_PATTERNS = [
-    r"\b(latest|current|recent|right now|breaking|live)\b",
+    r"\b(latest|current|recent|right now|breaking|live|trending)\b",
     r"\b(search for|look up|find out|what happened|news about|google)\b",
     r"\b(price of|stock price|weather in|sports score|election result|crypto price)\b",
     # Only trigger year search if combined with recency verb — bare years are not enough
     r"\b(in (2025|2026)|as of (2025|2026)|(2025|2026) (news|results|update|price|stats))\b",
     r"\b(who (won|lost|is leading|was elected|signed|announced))\b",
-    r"\b(today['']?s|this week['']?s|this month['']?s)\b",
+    r"\b(today['']?s|this week['']?s|this month['']?s|today|this week|this month)\b",
+    r"\b(news|headlines|breaking news)\b",
 ]
 
 # Patterns that look like search but are NOT — override search classification

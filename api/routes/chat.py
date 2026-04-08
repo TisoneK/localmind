@@ -44,6 +44,7 @@ async def _event_stream(
     filename=None,
     content_type=None,
     file_full_path=None,   # full path sent by UI if available
+    original_path=None,    # original file location
 ):
     obs = ObsCollector()
     intent_emitted = False
@@ -58,6 +59,7 @@ async def _event_stream(
             filename=filename,
             content_type=content_type,
             obs=obs,
+            original_path=original_path,
         ):
             # Flush any buffered obs events before each text chunk
             for evt in obs.drain():
@@ -68,9 +70,15 @@ async def _event_stream(
                         "intent": evt.data.get("primary"),
                         "confidence": float(evt.data.get("confidence", 0.5)),
                     })
-                # Capture file write metadata for the done event
-                if evt.type == "tool_dispatched" and evt.data.get("tool") == "file_write":
-                    pass  # path comes through chunk metadata below
+                if evt.type == 'tool_dispatched' and not intent_emitted:
+                    intent_emitted = True
+
+            # Process each chunk and capture observability events
+            if hasattr(chunk, 'metadata') and chunk.metadata:
+                # Chunk contains observability data from agent
+                obs_evt = chunk.metadata.get('obs_event')
+                if obs_evt:
+                    yield _sse(obs_evt.to_sse_dict())
 
             if chunk.error:
                 yield _sse({"error": chunk.error, "done": True})
@@ -88,7 +96,8 @@ async def _event_stream(
                     done_payload["file_path"] = file_path_written
                     done_payload["file_name"] = file_name_written or Path(file_path_written).name
                 yield _sse(done_payload)
-            else:
+            elif chunk.text:
+                logger.debug(f"[chat] yielding text chunk: '{chunk.text}' (done=False)")
                 yield _sse({"text": chunk.text, "done": False})
 
         # Final obs flush (turn_complete lands here)
@@ -106,8 +115,13 @@ async def chat(
     session_id: str = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
     file_full_path: Optional[str] = Form(default=None),  # full path from UI
+    original_path: Optional[str] = Form(default=None),  # original file location
 ):
     """Stream a chat response as Server-Sent Events."""
+    logger.info(f"Chat request: message='{message}', session_id='{session_id}'")
+    logger.info(f"File received: {file is not None}, filename: {file.filename if file else 'None'}")
+    logger.info(f"File full path: {file_full_path}")
+    
     sid = session_id or str(uuid.uuid4())
 
     file_bytes = None
@@ -133,7 +147,7 @@ async def chat(
             file_full_path = str(dest)
 
     return StreamingResponse(
-        _event_stream(message, sid, file_bytes, filename, file_content_type, file_full_path),
+        _event_stream(message, sid, file_bytes, filename, file_content_type, file_full_path, original_path),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

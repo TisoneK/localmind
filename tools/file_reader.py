@@ -17,11 +17,15 @@ from pathlib import Path
 
 from core.models import Intent, FileAttachment, ToolResult, RiskLevel
 from tools import register_tool
+from core.config import settings
+
+# All dependencies are now managed in pyproject.toml and installed via pip
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTS = {".pdf", ".docx", ".txt", ".md", ".csv", ".xlsx", ".py", ".js", ".ts",
-                  ".json", ".yaml", ".yml", ".toml", ".html", ".xml", ".sh", ".rs", ".go"}
+                  ".json", ".yaml", ".yml", ".toml", ".html", ".xml", ".sh", ".rs", ".go",
+                  ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
 
 
 def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -43,10 +47,12 @@ async def _parse_pdf(data: bytes) -> str:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=data, filetype="pdf")
         pages = [page.get_text() for page in doc]
-        return "\n\n".join(pages)
-    except ImportError:
-        return "[PDF parsing requires pymupdf: pip install pymupdf]"
+        text = "\n\n".join(pages)
+        logger.info(f"[file_reader] PDF parsed: {len(text)} chars from {len(pages)} pages")
+        logger.info(f"[file_reader] First 200 chars: {text[:200]}")
+        return text
     except Exception as e:
+        logger.error(f"[file_reader] PDF parse error: {e}")
         return f"[PDF parse error: {e}]"
 
 
@@ -56,27 +62,75 @@ async def _parse_docx(data: bytes) -> str:
         from docx import Document
         doc = Document(io.BytesIO(data))
         return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except ImportError:
-        return "[DOCX parsing requires python-docx: pip install python-docx]"
     except Exception as e:
+        logger.error(f"[file_reader] DOCX parse error: {e}")
         return f"[DOCX parse error: {e}]"
+
+
+async def _parse_image(data: bytes, filename: str) -> str:
+    """Parse image using OCR and vision model for comprehensive analysis."""
+    try:
+        import io
+        from PIL import Image
+        import pytesseract
+        
+        # Open image from bytes
+        image = Image.open(io.BytesIO(data))
+        
+        # Get image metadata
+        width, height = image.size
+        format_name = image.format
+        
+        # Extract text using OCR
+        try:
+            text = pytesseract.image_to_string(image)
+        except Exception as ocr_error:
+            logger.warning(f"[file_reader] OCR failed: {ocr_error}")
+            logger.info("[file_reader] Tesseract OCR not available - using vision model only")
+            text = ""
+        
+        logger.info(f"[file_reader] Image parsed: {filename} ({width}x{height}, {format_name})")
+        logger.info(f"[file_reader] Extracted text: {len(text)} chars")
+        
+        # Skip vision model for now to prevent hanging - OCR only
+        logger.info("[file_reader] Using OCR-only processing (vision model disabled)")
+        visual_description = "\n\nVisual Description: [Vision analysis temporarily disabled]"
+        
+        # Build comprehensive result
+        result = f"Image: {filename} ({width}x{height}, {format_name})"
+        
+        if text.strip():
+            result += f"\n\nExtracted Text:\n{text}"
+        else:
+            result += "\n\nNo readable text found in image (OCR not available)."
+        
+        result += visual_description
+        
+        logger.info(f"[file_reader] First 200 chars of result: {result[:200]}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[file_reader] Image parse error: {e}")
+        return f"[Image parse error: {e}]"
 
 
 async def _parse_csv_xlsx(data: bytes, filename: str) -> str:
     try:
         import io
         import pandas as pd
+        import openpyxl
+        
         if filename.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(data), engine="openpyxl")
         else:
             df = pd.read_csv(io.BytesIO(data))
+        
         # Summary + first rows
         shape_info = f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\nColumns: {', '.join(df.columns.tolist())}\n\n"
         preview = df.head(20).to_markdown(index=False)
         return shape_info + preview
-    except ImportError:
-        return "[CSV/XLSX parsing requires pandas: pip install pandas openpyxl]"
     except Exception as e:
+        logger.error(f"[file_reader] CSV/XLSX parse error: {e}")
         return f"[CSV/XLSX parse error: {e}]"
 
 
@@ -85,12 +139,14 @@ async def parse_file(
     filename: str,
     content_type: str,
     chunk_size: int = 1500,
+    original_path: str = None,
 ) -> FileAttachment:
     """Parse raw file bytes into a FileAttachment with text chunks."""
     from core.config import settings
 
     ext = Path(filename).suffix.lower()
     overlap = getattr(settings, "localmind_chunk_overlap_tokens", 200)
+    logger.info(f"[file_reader] Processing file: {filename}, ext: {ext}, content_type: {content_type}")
 
     if ext == ".pdf" or content_type == "application/pdf":
         text = await _parse_pdf(data)
@@ -98,6 +154,8 @@ async def parse_file(
         text = await _parse_docx(data)
     elif ext in (".csv", ".xlsx"):
         text = await _parse_csv_xlsx(data, filename)
+    elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"):
+        text = await _parse_image(data, filename)
     else:
         # Plain text / code — decode as UTF-8
         try:
@@ -106,7 +164,8 @@ async def parse_file(
             text = f"[Could not read file: {e}]"
 
     chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-    logger.info(f"[file_reader] parsed {filename}: {len(text)} chars → {len(chunks)} chunks")
+    logger.info(f"[file_reader] parsed {filename}: {len(text)} chars -> {len(chunks)} chunks")
+    logger.info(f"[file_reader] first chunk: {chunks[0][:200] if chunks else 'NO CHUNKS'}")
 
     return FileAttachment(
         filename=filename,
@@ -116,9 +175,9 @@ async def parse_file(
     )
 
 
-async def file_task(message: str) -> ToolResult:
+async def file_task(message: str, original_path: str = None) -> ToolResult:
     """
-    FILE_TASK dispatch handler — used when no file is attached but the user
+    FILE_TASK dispatch handler - used when no file is attached but the user
     references a file by name. Returns a prompt to attach the file.
     """
     return ToolResult(

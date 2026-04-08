@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _VALID_INTENTS = {i.value for i in Intent}
 
 # Minimum rule-based confidence to skip the LLM call entirely
-_RULE_CONFIDENCE_THRESHOLD = 0.80
+_RULE_CONFIDENCE_THRESHOLD = 0.60
 
 # Rule-based confidence heuristic: non-CHAT matches are strong signals
 _RULE_CONFIDENCE_BY_INTENT: dict[str, float] = {
@@ -73,23 +73,38 @@ async def classify_with_llm(
     adapter,
 ) -> tuple[Intent, Optional[Intent], float]:
     """
-    Classify intent.  Rule-based first; LLM only when ambiguous.
+    Classify intent. Semantic first, then rule-based, then LLM fallback.
 
     Returns (primary, secondary, confidence).
     """
-    # ── Step 1: Fast rule-based classification ────────────────────────────
+    # Step 1: Try semantic classification (future-proof)
+    try:
+        from core.semantic_classifier import classify_intent_semantic
+        semantic_primary, semantic_secondary, semantic_confidence = classify_intent_semantic(message, has_attachment)
+        
+        # If semantic classification is confident, use it
+        if semantic_confidence >= 0.75:  # Higher threshold for semantic
+            logger.debug(
+                f"[classifier] semantic match: {semantic_primary.value} "
+                f"conf={semantic_confidence:.2f} (skipped rule-based + LLM)"
+            )
+            return semantic_primary, semantic_secondary, semantic_confidence
+    except Exception as e:
+        logger.debug(f"[classifier] semantic classification failed: {e}")
+
+    # Step 2: Fast rule-based classification
     rule_primary, rule_secondary = intent_router.classify_multi(message, has_attachment)
     rule_confidence = _RULE_CONFIDENCE_BY_INTENT.get(rule_primary.value, 0.70)
 
     if rule_confidence >= _RULE_CONFIDENCE_THRESHOLD:
-        # High confidence — skip LLM entirely, return immediately
+        # High confidence - skip LLM entirely, return immediately
         logger.debug(
             f"[classifier] rule-based shortcut: {rule_primary.value} "
             f"conf={rule_confidence:.2f} (skipped LLM)"
         )
         return rule_primary, rule_secondary, rule_confidence
 
-    # ── Step 2: LLM classification for ambiguous cases ────────────────────
+    # ── Step 3: LLM classification for ambiguous cases ────────────────────
     # Use fast model if configured; fall back to main model
     from core.config import settings
     fast_model = getattr(settings, "ollama_model_fast", "")

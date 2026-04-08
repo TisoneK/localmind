@@ -118,8 +118,10 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     if context.file_attachment and context.file_attachment.chunks:
         chunks_text = "\n\n---\n\n".join(context.file_attachment.chunks)
         file_text = (
-            f"\n\nFile attached by user: {context.file_attachment.filename}\n"
-            f"Content:\n{chunks_text}"
+            f"\n\nFile: {context.file_attachment.filename}\n"
+            f"Content:\n{chunks_text}\n\n"
+            f"CONTEXT: This file content is provided as background information. "
+            f"Analyze it and answer the user's question about it. Do not output the file content directly."
         )
         system_parts.append(file_text)
 

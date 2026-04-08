@@ -38,6 +38,10 @@ dependencies = [
     "python-docx>=1.1.0",       # DOCX
     "pandas>=2.2.0",            # CSV / Excel
     "openpyxl>=3.1.0",          # Excel support for pandas
+    "pillow>=10.0.0",           # Image processing
+    "pytesseract>=0.3.10",      # OCR text extraction
+    "transformers>=4.40.0",     # Vision models
+    "torch>=2.3.0",             # PyTorch for vision models
 
     # Web search
     "ddgs>=6.1.0",
@@ -57,6 +61,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "aiofiles>=23.2.0",
     "tiktoken>=0.7.0",          # Token counting
+    "numpy>=1.24.0",            # Required for semantic similarity calculations
 ]
 
 [project.optional-dependencies]
@@ -67,6 +72,9 @@ dev = [
     "httpx>=0.27.0",            # For FastAPI test client
     "ruff>=0.4.0",
     "mypy>=1.10.0",
+]
+semantic = [
+    "sentence-transformers>=2.7.0",  # Semantic embeddings for intent classification
 ]
 
 [project.scripts]
