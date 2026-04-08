@@ -73,6 +73,29 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         logger.info(f"LocalMind — model: {settings.ollama_model} | ui: {UI_HTML.exists()}")
+        
+        # Background task to pre-warm ChromaDB to avoid cold-start delays
+        async def warm_chromadb():
+            try:
+                from storage.vector import VectorStore
+                logger.info("[startup] pre-warming ChromaDB...")
+                vector_store = VectorStore()
+                client = vector_store._get_client()
+                if client:
+                    count = await vector_store.count()
+                    logger.info(f"[startup] ChromaDB ready — {count} facts stored")
+                else:
+                    logger.info("[startup] ChromaDB not available (chromadb not installed)")
+            except Exception as e:
+                logger.warning(f"[startup] ChromaDB warm-up failed: {e}")
+        
+        # Start ChromaDB warm-up in background
+        import asyncio
+        background_tasks = set()
+        task = asyncio.create_task(warm_chromadb())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        
         # Warm up model router with currently pulled models
         try:
             from adapters.ollama import OllamaAdapter
