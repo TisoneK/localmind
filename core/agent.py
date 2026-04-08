@@ -206,6 +206,109 @@ def _truncate_web_search_results(search_content: str) -> str:
     return '\n'.join(truncated_results)
 
 
+async def _summarize_search_results_background(filename: str, original_query: str) -> None:
+    """
+    Background task to summarize search results after file is written.
+    Uses extractive summarization (no LLM) for instant results.
+    """
+    import asyncio
+    import os
+    from pathlib import Path
+    
+    try:
+        # Look for any file that starts with the expected filename in the correct LocalMind directory
+        from core.config import settings
+        localmind_dir = Path(settings.localmind_home)
+        
+        # Write test file to verify background task is running
+        test_file = localmind_dir / filename.replace('.md', '_test.txt')
+        with open(test_file, 'w', encoding='utf-8') as f:
+            f.write(f"Background task started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Wait a bit to ensure file is fully written
+        await asyncio.sleep(2)
+        
+        # Find the actual search results file (might have different timestamp)
+        base_name = filename.replace('.md', '')
+        search_files = list(localmind_dir.glob(f"{base_name}*.md"))
+        
+        if not search_files:
+            logger.error(f"[agent] No search results file found matching pattern: {base_name}*.md")
+            return
+            
+        # Use the most recent file
+        search_file = max(search_files, key=lambda f: f.stat().st_mtime)
+        logger.info(f"[agent] Found search results file: {search_file}")
+        
+        # Read the search results file
+        try:
+            content = search_file.read_text(encoding='utf-8')
+            logger.info(f"[agent] Background task successfully read {search_file}")
+        except Exception as read_error:
+            logger.error(f"[agent] Failed to read search results file {search_file}: {read_error}")
+            return
+        except Exception as read_error:
+            logger.error(f"[agent] Failed to read search results file {search_file}: {read_error}")
+            return
+        
+        # Extractive summarization - pull key headlines and first sentences
+        lines = content.split('\n')
+        summary_points = []
+        
+        logger.info(f"[agent] Background processing {len(lines)} lines from search results")
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            # Look for result titles (start with number and **)
+            if line.startswith(tuple(f"{i}." for i in range(1, 10))) and '**' in line:
+                # Extract the title
+                parts = line.split('**')
+                if len(parts) >= 2:
+                    title = parts[1].split('**')[0].strip()
+                    if title and len(summary_points) < 5:
+                        summary_points.append(f"• {title}")
+                        logger.info(f"[agent] Extracted title: {title}")
+            
+            # Look for URLs and descriptions
+            elif line.startswith('https://') and len(summary_points) > 0:
+                # Add as a detail to the last point
+                if summary_points:
+                    summary_points[-1] += f" ([Source]({line}))"
+                    logger.info(f"[agent] Added source URL to last point")
+        
+        logger.info(f"[agent] Extracted {len(summary_points)} summary points")
+        
+        # Create extractive summary
+        try:
+            if summary_points:
+                summary = f"# Quick Summary: {original_query}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n" + "\n".join(summary_points[:5])
+                logger.info(f"[agent] Created summary with {len(summary_points)} points")
+            else:
+                # Fallback: just use first few lines
+                summary = f"# Quick Summary: {original_query}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\nKey findings from search results:\n" + "\n".join(lines[:10])
+                logger.info(f"[agent] Created fallback summary with {len(lines)} lines")
+            
+            # Write summary to a separate file in LocalMind directory
+            summary_filename = filename.replace('.md', '_summary.md')
+            summary_file = localmind_dir / summary_filename
+            summary_file.write_text(summary, encoding='utf-8')
+            
+            logger.info(f"[agent] Background extractive summary completed: {summary_file}")
+            logger.info(f"[agent] Summary file size: {len(summary)} characters")
+            
+        except Exception as summary_error:
+            logger.error(f"[agent] Failed to create summary: {summary_error}")
+            # Write error summary
+            error_summary = f"# Summary Error\n\nFailed to create summary for: {original_query}\n\nError: {summary_error}"
+            error_filename = filename.replace('.md', '_error.md')
+            error_file = localmind_dir / error_filename
+            error_file.write_text(error_summary, encoding='utf-8')
+            logger.error(f"[agent] Error summary written to: {error_file}")
+        
+    except Exception as e:
+        logger.error(f"[agent] Background summarization failed: {e}")
+
+
 async def _dispatch_with_retry(
     tool_intent: Intent,
     tool_input: str,
@@ -430,26 +533,37 @@ class AgentLoop:
                         else:
                             safe_obs = _filter_tool_injection(tool_result.content)
                         
-                        # For web search, write results to file and finish immediately to bypass LLM synthesis
+                        # For web search, write results to file and start background summarization
                         if tool_intent == Intent.WEB_SEARCH:
+                            # Let file_write tool handle directory automatically
                             filename = f"search_results_{int(time.time())}.md"
                             file_content = f"# Web Search Results: {tool_input}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n{safe_obs}"
                             try:
-                                # Use the file_write tool for consistency
+                                # Use file_write tool for consistency
                                 from tools import dispatch
                                 file_result, file_failed, file_retry = await _dispatch_with_retry(
-                                    Intent.FILE_WRITE, f"{filename}:{file_content}"
+                                    Intent.FILE_WRITE, f"Write search results to {filename}:\n\n{file_content}"
                                 )
                                 
                                 if not file_failed and file_result:
                                     logger.info(f"[agent] Web search results written to {filename} using file_write tool")
-                                    final_response = f"Web search completed! Results saved to `{filename}`\n\nKey findings:\n{_truncate_web_search_results(safe_obs)}"
-                                    trace.final_response = final_response
+                                    
+                                    # Start background summarization task
+                                    import asyncio
+                                    try:
+                                        asyncio.create_task(_summarize_search_results_background(filename, tool_input))
+                                        logger.info(f"[agent] Started background summarization for {filename}")
+                                    except Exception as bg_error:
+                                        logger.error(f"[agent] Failed to start background summarization: {bg_error}")
+                                    
+                                    # Immediate response with file link
+                                    immediate_response = f"✅ **Search complete!** Full results saved to `{filename}`\n\n🔄 **Generating summary in background...**\n\n💡 *Quick preview:*\n{_truncate_web_search_results(safe_obs)}"
+                                    trace.final_response = immediate_response
                                     trace.steps.append(AgentStep(
                                         iteration=iteration + 1, thought=thought,
-                                        tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}",
+                                        tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}, summary started in background",
                                     ))
-                                    yield StreamChunk(text=final_response, done=False)
+                                    yield StreamChunk(text=immediate_response, done=False)
                                     yield StreamChunk(text="", done=True)
                                     return
                                 else:
