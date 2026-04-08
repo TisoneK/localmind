@@ -27,16 +27,20 @@ from tools import dispatch
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 3
+MAX_ITERATIONS = 2
 CLARIFICATION_THRESHOLD = 0.45
 
 # Max characters kept per observation entry in the running log.
 # Full observation is stored in AgentStep for trace/debug purposes.
-OBS_LOG_MAX_CHARS = 800
+OBS_LOG_MAX_CHARS = 100  # Extreme reduction for local LLM
 
 # Retry config per tool call
 TOOL_MAX_RETRIES = 2
 TOOL_RETRY_BASE_DELAY = 0.5  # seconds; doubles each retry
+
+# Web search result truncation to prevent context bloat
+WEB_SEARCH_MAX_CHARS_PER_RESULT = 100  # Extreme reduction
+WEB_SEARCH_MAX_RESULTS = 1  # Only 1 result to minimize context
 
 AGENT_INTENTS = {
     Intent.WEB_SEARCH,
@@ -158,6 +162,50 @@ def _truncate_observation(obs: str, max_chars: int = OBS_LOG_MAX_CHARS) -> str:
     return obs[:half] + f"\n... [{len(obs) - max_chars} chars truncated] ...\n" + obs[-half:]
 
 
+def _truncate_web_search_results(search_content: str) -> str:
+    """
+    Truncate web search results to prevent context bloat and LLM hanging.
+    
+    Takes formatted search results like:
+    1. **Title**
+       URL
+       Description...
+    
+    And truncates each result to WEB_SEARCH_MAX_CHARS_PER_RESULT chars,
+    keeping only WEB_SEARCH_MAX_RESULTS results.
+    """
+    lines = search_content.split('\n')
+    truncated_results = []
+    current_result = []
+    result_count = 0
+    
+    for line in lines:
+        # Detect new result (starts with number and **)
+        if line.strip().startswith(tuple(f"{i}." for i in range(1, 10))):
+            # Save previous result if exists
+            if current_result and result_count < WEB_SEARCH_MAX_RESULTS:
+                result_text = '\n'.join(current_result)
+                if len(result_text) > WEB_SEARCH_MAX_CHARS_PER_RESULT:
+                    result_text = result_text[:WEB_SEARCH_MAX_CHARS_PER_RESULT] + "..."
+                truncated_results.append(result_text)
+                result_count += 1
+            
+            # Start new result
+            current_result = [line]
+        else:
+            # Add to current result
+            current_result.append(line)
+    
+    # Don't forget the last result
+    if current_result and result_count < WEB_SEARCH_MAX_RESULTS:
+        result_text = '\n'.join(current_result)
+        if len(result_text) > WEB_SEARCH_MAX_CHARS_PER_RESULT:
+            result_text = result_text[:WEB_SEARCH_MAX_CHARS_PER_RESULT] + "..."
+        truncated_results.append(result_text)
+    
+    return '\n'.join(truncated_results)
+
+
 async def _dispatch_with_retry(
     tool_intent: Intent,
     tool_input: str,
@@ -259,8 +307,12 @@ class AgentLoop:
 
             # ── Collect thought, stream sanitized version live ────────────
             thought_chunks: list[str] = []
+            t_llm_start = time.monotonic()
             async for chunk in active_adapter.chat(iteration_messages, temperature=0.3):
                 thought_chunks.append(chunk.text)
+            t_llm_end = time.monotonic()
+            llm_time_ms = round((t_llm_end - t_llm_start) * 1000)
+            logger.info(f"[agent] iter={iteration+1} LLM call: {llm_time_ms}ms")
             thought = "".join(thought_chunks)
 
             # Stream the reasoning text (tags stripped) so UI shows thinking
@@ -369,6 +421,7 @@ class AgentLoop:
                         tool_intent, tool_input
                     )
                     latency_ms = round((time.monotonic() - t_tool) * 1000)
+                    logger.info(f"[agent] iter={iteration+1} tool={tool_name}: {latency_ms}ms")
 
                     if tool_result:
                         # Filter prompt injection from tool output before re-entering context
@@ -376,6 +429,30 @@ class AgentLoop:
                             safe_obs = _filter_code_output(tool_result.content)
                         else:
                             safe_obs = _filter_tool_injection(tool_result.content)
+                        
+                        # For web search, write results to file and finish immediately to bypass LLM synthesis
+                        if tool_intent == Intent.WEB_SEARCH:
+                            filename = f"search_results_{int(time.time())}.md"
+                            try:
+                                with open(filename, 'w', encoding='utf-8') as f:
+                                    f.write(f"# Web Search Results: {tool_input}\n\n")
+                                    f.write(f"*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
+                                    f.write(safe_obs)
+                                
+                                logger.info(f"[agent] Web search results written to {filename}")
+                                final_response = f"Web search completed! Results saved to `{filename}`\n\nKey findings:\n{_truncate_web_search_results(safe_obs)}"
+                                trace.final_response = final_response
+                                trace.steps.append(AgentStep(
+                                    iteration=iteration + 1, thought=thought,
+                                    tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}",
+                                ))
+                                yield StreamChunk(text=final_response, done=False)
+                                yield StreamChunk(text="", done=True)
+                                return
+                            except Exception as e:
+                                logger.error(f"[agent] Failed to write search results to file: {e}")
+                                # Fall back to normal processing if file write fails
+                        
                         observation = safe_obs
                         last_tool_failed = False
                         consecutive_failures = 0
@@ -384,19 +461,6 @@ class AgentLoop:
                                 text=f"*(succeeded after {retry_count} retr{'y' if retry_count == 1 else 'ies'})*\n",
                                 done=False,
                             )
-                        
-                        # Early termination: if web search got good results, finish immediately
-                        if tool_intent == Intent.WEB_SEARCH and tool_result.metadata.get('result_count', 0) > 0:
-                            logger.info(f"[agent] Early finish: got {tool_result.metadata.get('result_count')} web search results")
-                            final_response = f"Here are the latest search results for '{tool_input}':\n\n{tool_result.content}"
-                            trace.final_response = final_response
-                            trace.steps.append(AgentStep(
-                                iteration=iteration + 1, thought=thought,
-                                tool_name=tool_name, tool_input=tool_input, observation=observation,
-                            ))
-                            yield StreamChunk(text=final_response, done=False)
-                            yield StreamChunk(text="", done=True)
-                            return
                     else:
                         observation = f"[Tool '{tool_name}' returned no result after {retry_count} retries]"
                         tool_failed = True
@@ -449,9 +513,21 @@ class AgentLoop:
                 "based on everything gathered so far."
             )
         }]
-        async for chunk in active_adapter.chat(force_msg, temperature=0.4):
-            filtered_chunk = StreamChunk(
-                text=_filter_system_leaks(chunk.text),
-                done=chunk.done,
+        try:
+            t_final_start = time.monotonic()
+            chat_coroutine = active_adapter.chat(force_msg, temperature=0.4)
+            async for chunk in chat_coroutine:
+                filtered_chunk = StreamChunk(
+                    text=_filter_system_leaks(chunk.text),
+                    done=chunk.done,
+                )
+                yield filtered_chunk
+            t_final_end = time.monotonic()
+            final_time_ms = round((t_final_end - t_final_start) * 1000)
+            logger.info(f"[agent] final LLM synthesis: {final_time_ms}ms")
+        except Exception as e:
+            logger.warning(f"[agent] Final LLM synthesis failed: {e}")
+            yield StreamChunk(
+                text="I apologize, but I'm unable to synthesize a response due to time constraints. Here are the key findings from my search:\n\n" + observation_log,
+                done=True
             )
-            yield filtered_chunk
