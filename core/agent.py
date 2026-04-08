@@ -19,6 +19,9 @@ from tools import dispatch
 
 logger = logging.getLogger(__name__)
 
+# Import leak filter once at module level
+from core.filters import _filter_system_leaks
+
 MAX_ITERATIONS = 6  # was 12 — tighter loop, faster bail-out
 
 AGENT_INTENTS = {
@@ -178,6 +181,11 @@ class AgentLoop:
             thought = "".join(thought_chunks)
 
             logger.debug(f"[agent] iter={iteration+1} thought={thought[:100]}...")
+            
+            # Stream sanitized thinking summary to UI before processing tags
+            thinking_display = re.sub(r"<(action|finish|reflect|clarify)>.*?</\1>", "", thought, flags=re.DOTALL | re.IGNORECASE).strip()
+            if thinking_display:
+                yield StreamChunk(text=f"*{thinking_display}*\n", done=False)
 
             # ── Clarify ──────────────────────────────────────────────────────
             clarify_match = _CLARIFY_PATTERN.search(thought)
@@ -197,6 +205,8 @@ class AgentLoop:
             finish_match = _FINISH_PATTERN.search(thought)
             if finish_match:
                 final_response = finish_match.group(1).strip()
+                # Filter out any system leaks that might have gotten through
+                final_response = _filter_system_leaks(final_response)
                 trace.final_response = final_response
                 trace.steps.append(AgentStep(
                     iteration=iteration + 1, thought=thought,
@@ -218,12 +228,35 @@ class AgentLoop:
                     reflection=reflection_text,
                 ))
                 last_tool_failed = "failed" in reflection_text.lower()
-                # Stream a status line so user isn't staring at blank screen
-                quality_line = next(
-                    (l for l in reflection_text.splitlines() if "quality:" in l.lower()), ""
-                )
-                if quality_line:
-                    yield StreamChunk(text=f"\n_[Thinking: {quality_line.strip()}]_\n", done=False)
+                # Stream descriptive thinking output so users understand what's happening
+                yield StreamChunk(text=f"\n# Reasoning\n", done=False)
+                
+                # Parse reflection content for meaningful details (robust parsing)
+                lines = reflection_text.splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Case-insensitive parsing with fallback
+                    lower_line = line.lower()
+                    
+                    if lower_line.startswith("quality:"):
+                        quality = line.split(":", 1)[1].strip().lower()
+                        if quality == "good":
+                            yield StreamChunk(text="Task completed successfully.\n", done=False)
+                        elif quality == "partial":
+                            yield StreamChunk(text="Partial progress made, continuing...\n", done=False)
+                        elif quality == "failed":
+                            yield StreamChunk(text="Previous approach failed, trying alternative.\n", done=False)
+                        else:
+                            yield StreamChunk(text=f"Status: {quality}\n", done=False)
+                    elif lower_line.startswith("issue:"):
+                        issue = line.split(":", 1)[1].strip()
+                        yield StreamChunk(text=f"Problem: {issue}\n", done=False)
+                    elif lower_line.startswith("next:"):
+                        next_step = line.split(":", 1)[1].strip()
+                        yield StreamChunk(text=f"Next step: {next_step}\n", done=False)
                 continue
 
             # ── Action ───────────────────────────────────────────────────────
@@ -232,8 +265,19 @@ class AgentLoop:
                 tool_name = action_match.group(1).strip()
                 tool_input = action_match.group(2).strip()
                 logger.info(f"[agent] iter={iteration+1} tool={tool_name} input={tool_input[:80]}")
-                # Stream a status line so user knows what's happening
-                yield StreamChunk(text=f"\n_[Using {tool_name}: {tool_input[:60]}{'…' if len(tool_input) > 60 else ''}]_\n", done=False)
+                # Stream descriptive tool action so users see what's happening
+                yield StreamChunk(text=f"\n## Action: {tool_name}\n", done=False)
+                # Add context based on tool type
+                if tool_name == "file_write":
+                    yield StreamChunk(text=f"Creating file: {tool_input}\n", done=False)
+                elif tool_name == "code_exec":
+                    yield StreamChunk(text=f"Executing code...\n", done=False)
+                elif tool_name == "web_search":
+                    yield StreamChunk(text=f"Searching for: {tool_input}\n", done=False)
+                elif tool_name == "read_file":
+                    yield StreamChunk(text=f"Reading file: {tool_input}\n", done=False)
+                else:
+                    yield StreamChunk(text=f"Input: {tool_input}\n", done=False)
 
                 tool_failed = False
                 try:
@@ -262,16 +306,19 @@ class AgentLoop:
                     observation=observation[:500],
                     tool_failed=tool_failed,
                 ))
+                # Truncate observation for context to prevent bloat (same limit as trace)
+                truncated_obs = observation[:500] + ("..." if len(observation) > 500 else "")
                 observation_log += (
                     f"\n[Tool: {tool_name} | Input: {tool_input[:60]} | "
                     f"Status: {'FAILED' if tool_failed else 'OK'}]\n"
-                    f"{observation}\n"
+                    f"{truncated_obs}\n"
                 )
                 continue
 
             # No structured tag found — treat as finish
             logger.warning(f"[agent] no tag at iteration {iteration+1}, treating as finish")
-            yield StreamChunk(text=thought, done=False)  # B6: single chunk
+            filtered_thought = _filter_system_leaks(thought)
+            yield StreamChunk(text=filtered_thought, done=False)  # B6: single chunk
             yield StreamChunk(text="", done=True)
             return
 
@@ -287,4 +334,6 @@ class AgentLoop:
             )
         }]
         async for chunk in _adapter.chat(force_msg, temperature=0.4):
-            yield chunk
+            # Filter any leaks from the fallback response
+            filtered_chunk = StreamChunk(text=_filter_system_leaks(chunk.text), done=chunk.done)
+            yield filtered_chunk

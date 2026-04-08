@@ -53,7 +53,7 @@ Classify the user message into one of these intents:
 - chat: general conversation, questions answerable from knowledge alone
 - web_search: needs current/live information, recent events, prices, news
 - code_exec: run/execute code, compute output, evaluate a script
-- memory_op: remember/recall/store user preferences or past info
+- memory_op: explicit commands to remember/recall/store facts (e.g. "remember that", "note that", "store this")
 - file_task: read, parse, summarize an existing file
 - file_write: create, write, save content to a new file
 

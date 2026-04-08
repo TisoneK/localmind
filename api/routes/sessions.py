@@ -45,9 +45,15 @@ async def list_sessions():
 @router.get("/sessions/{session_id}/history")
 async def get_history(session_id: str):
     """Get full message history for a session."""
+    # First check if session exists
+    sessions = _store.list_sessions()
+    session_exists = any(s.id == session_id for s in sessions)
+    
+    if not session_exists:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get messages (may be empty for new sessions)
     messages = _store.get_history(session_id)
-    if not messages:
-        raise HTTPException(status_code=404, detail="Session not found or empty")
     return [
         {
             "role": m.role.value,

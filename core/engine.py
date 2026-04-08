@@ -38,6 +38,8 @@ from tools import dispatch, available_tools
 
 logger = logging.getLogger(__name__)
 
+# Import response filters
+from core.filters import _filter_system_leaks
 
 from core.model_router import best_model_for, update_pulled_models
 
@@ -286,6 +288,9 @@ class Engine:
                 yield chunk
 
         response_text = "".join(full_response)
+        
+        # Filter out system prompt leaks before storing/displaying
+        response_text = _filter_system_leaks(response_text)
 
         # ── 8. Secondary intent ────────────────────────────────────────────
         if secondary_intent == Intent.FILE_WRITE and tool_result:
