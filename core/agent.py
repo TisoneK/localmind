@@ -259,16 +259,8 @@ class AgentLoop:
 
             # ── Collect thought, stream sanitized version live ────────────
             thought_chunks: list[str] = []
-            try:
-                async for chunk in asyncio.wait_for(
-                    active_adapter.chat(iteration_messages, temperature=0.3),
-                    timeout=30.0  # 30 second timeout per LLM call
-                ):
-                    thought_chunks.append(chunk.text)
-            except asyncio.TimeoutError:
-                logger.warning(f"[agent] LLM call timed out at iteration {iteration+1}")
-                thought = "finish: I apologize, but I'm taking too long to respond. Let me provide my best answer based on what I've gathered so far."
-                thought_chunks = [thought]
+            async for chunk in active_adapter.chat(iteration_messages, temperature=0.3):
+                thought_chunks.append(chunk.text)
             thought = "".join(thought_chunks)
 
             # Stream the reasoning text (tags stripped) so UI shows thinking
@@ -392,6 +384,19 @@ class AgentLoop:
                                 text=f"*(succeeded after {retry_count} retr{'y' if retry_count == 1 else 'ies'})*\n",
                                 done=False,
                             )
+                        
+                        # Early termination: if web search got good results, finish immediately
+                        if tool_intent == Intent.WEB_SEARCH and tool_result.metadata.get('result_count', 0) > 0:
+                            logger.info(f"[agent] Early finish: got {tool_result.metadata.get('result_count')} web search results")
+                            final_response = f"Here are the latest search results for '{tool_input}':\n\n{tool_result.content}"
+                            trace.final_response = final_response
+                            trace.steps.append(AgentStep(
+                                iteration=iteration + 1, thought=thought,
+                                tool_name=tool_name, tool_input=tool_input, observation=observation,
+                            ))
+                            yield StreamChunk(text=final_response, done=False)
+                            yield StreamChunk(text="", done=True)
+                            return
                     else:
                         observation = f"[Tool '{tool_name}' returned no result after {retry_count} retries]"
                         tool_failed = True
@@ -444,19 +449,9 @@ class AgentLoop:
                 "based on everything gathered so far."
             )
         }]
-        try:
-            async for chunk in asyncio.wait_for(
-                active_adapter.chat(force_msg, temperature=0.4),
-                timeout=30.0  # 30 second timeout
-            ):
-                filtered_chunk = StreamChunk(
-                    text=_filter_system_leaks(chunk.text),
-                    done=chunk.done,
-                )
-                yield filtered_chunk
-        except asyncio.TimeoutError:
-            logger.warning("[agent] Final LLM call timed out")
-            yield StreamChunk(
-                text="I apologize, but I'm unable to complete this request due to time constraints. Please try rephrasing your question or breaking it into smaller parts.",
-                done=True
+        async for chunk in active_adapter.chat(force_msg, temperature=0.4):
+            filtered_chunk = StreamChunk(
+                text=_filter_system_leaks(chunk.text),
+                done=chunk.done,
             )
+            yield filtered_chunk
