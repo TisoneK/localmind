@@ -27,7 +27,7 @@ from tools import dispatch
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 6
+MAX_ITERATIONS = 3
 CLARIFICATION_THRESHOLD = 0.45
 
 # Max characters kept per observation entry in the running log.
@@ -259,8 +259,16 @@ class AgentLoop:
 
             # ── Collect thought, stream sanitized version live ────────────
             thought_chunks: list[str] = []
-            async for chunk in active_adapter.chat(iteration_messages, temperature=0.3):
-                thought_chunks.append(chunk.text)
+            try:
+                async for chunk in asyncio.wait_for(
+                    active_adapter.chat(iteration_messages, temperature=0.3),
+                    timeout=30.0  # 30 second timeout per LLM call
+                ):
+                    thought_chunks.append(chunk.text)
+            except asyncio.TimeoutError:
+                logger.warning(f"[agent] LLM call timed out at iteration {iteration+1}")
+                thought = "finish: I apologize, but I'm taking too long to respond. Let me provide my best answer based on what I've gathered so far."
+                thought_chunks = [thought]
             thought = "".join(thought_chunks)
 
             # Stream the reasoning text (tags stripped) so UI shows thinking
@@ -436,9 +444,19 @@ class AgentLoop:
                 "based on everything gathered so far."
             )
         }]
-        async for chunk in active_adapter.chat(force_msg, temperature=0.4):
-            filtered_chunk = StreamChunk(
-                text=_filter_system_leaks(chunk.text),
-                done=chunk.done,
+        try:
+            async for chunk in asyncio.wait_for(
+                active_adapter.chat(force_msg, temperature=0.4),
+                timeout=30.0  # 30 second timeout
+            ):
+                filtered_chunk = StreamChunk(
+                    text=_filter_system_leaks(chunk.text),
+                    done=chunk.done,
+                )
+                yield filtered_chunk
+        except asyncio.TimeoutError:
+            logger.warning("[agent] Final LLM call timed out")
+            yield StreamChunk(
+                text="I apologize, but I'm unable to complete this request due to time constraints. Please try rephrasing your question or breaking it into smaller parts.",
+                done=True
             )
-            yield filtered_chunk
