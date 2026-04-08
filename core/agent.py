@@ -162,6 +162,34 @@ def _truncate_observation(obs: str, max_chars: int = OBS_LOG_MAX_CHARS) -> str:
     return obs[:half] + f"\n... [{len(obs) - max_chars} chars truncated] ...\n" + obs[-half:]
 
 
+def _create_extractive_summary(search_content: str, query: str) -> str:
+    """
+    Create immediate extractive summary from search results.
+    """
+    lines = search_content.split('\n')
+    summary_points = []
+    
+    for line in lines:
+        line = line.strip()
+        # Look for result titles (start with number and **)
+        if line.startswith(tuple(f"{i}." for i in range(1, 10))) and '**' in line:
+            # Extract the title
+            parts = line.split('**')
+            if len(parts) >= 2:
+                title = parts[1].split('**')[0].strip()
+                if title and len(summary_points) < 5:
+                    summary_points.append(f"• {title}")
+    
+    # Create summary
+    if summary_points:
+        summary = f"# Quick Summary: {query}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n" + "\n".join(summary_points[:5])
+    else:
+        # Fallback: just use first few lines
+        summary = f"# Quick Summary: {query}\n\n*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\nKey findings from search results:\n" + "\n".join(lines[:10])
+    
+    return summary
+
+
 def _truncate_web_search_results(search_content: str) -> str:
     """
     Truncate web search results to prevent context bloat and LLM hanging.
@@ -542,26 +570,33 @@ class AgentLoop:
                                 # Use file_write tool for consistency
                                 from tools import dispatch
                                 file_result, file_failed, file_retry = await _dispatch_with_retry(
-                                    Intent.FILE_WRITE, f"Write search results to {filename}:\n\n{file_content}"
+                                    Intent.FILE_WRITE, f"{filename}:\n\n{file_content}"
                                 )
                                 
                                 if not file_failed and file_result:
                                     logger.info(f"[agent] Web search results written to {filename} using file_write tool")
                                     
-                                    # Start background summarization task
-                                    import asyncio
-                                    try:
-                                        asyncio.create_task(_summarize_search_results_background(filename, tool_input))
-                                        logger.info(f"[agent] Started background summarization for {filename}")
-                                    except Exception as bg_error:
-                                        logger.error(f"[agent] Failed to start background summarization: {bg_error}")
+                                    # Create immediate extractive summary
+                                    summary = _create_extractive_summary(safe_obs, tool_input)
                                     
-                                    # Immediate response with file link
-                                    immediate_response = f"✅ **Search complete!** Full results saved to `{filename}`\n\n🔄 **Generating summary in background...**\n\n💡 *Quick preview:*\n{_truncate_web_search_results(safe_obs)}"
+                                    # Write summary file
+                                    summary_filename = filename.replace('.md', '_summary.md')
+                                    from tools import dispatch
+                                    summary_result, summary_failed, summary_retry = await _dispatch_with_retry(
+                                        Intent.FILE_WRITE, f"{summary_filename}:\n\n{summary}"
+                                    )
+                                    
+                                    if not summary_failed and summary_result:
+                                        logger.info(f"[agent] Summary written to {summary_filename}")
+                                    else:
+                                        logger.error(f"[agent] Failed to write summary: {summary_result}")
+                            
+                                    # Immediate response with both files
+                                    immediate_response = f"✅ **Search complete!** Full results saved to `{filename}`\n\n📄 **Summary created:** `{summary_filename}`\n\n💡 *Quick preview:*\n{_truncate_web_search_results(safe_obs)}"
                                     trace.final_response = immediate_response
                                     trace.steps.append(AgentStep(
                                         iteration=iteration + 1, thought=thought,
-                                        tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}, summary started in background",
+                                        tool_name=tool_name, tool_input=tool_input, observation=f"Results written to {filename}, summary created: {summary_filename}",
                                     ))
                                     yield StreamChunk(text=immediate_response, done=False)
                                     yield StreamChunk(text="", done=True)
