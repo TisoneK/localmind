@@ -176,7 +176,9 @@ class Engine:
         _memory_hint_words = {"earlier", "before", "last time", "you said", "remember", "told you", "previous"}
         _has_memory_hint = any(w in message.lower() for w in _memory_hint_words)
 
+        print(f"[DEBUG] Fast-path check: primary={_fast_primary}, has_attachment={has_attachment}, has_memory_hint={_has_memory_hint}")
         if _fast_primary == Intent.CHAT and not has_attachment and not _has_memory_hint:
+            print(f"[DEBUG] CHAT fast-path triggered!")
             from core.intent_classifier import _RULE_CONFIDENCE_BY_INTENT
             _fast_conf = _RULE_CONFIDENCE_BY_INTENT.get(Intent.CHAT.value, 0.85)
             _obs.emit("intent_classified", primary="chat", secondary="none", confidence=_fast_conf)
@@ -248,15 +250,22 @@ class Engine:
             )
 
         # ── 5. Memory retrieval ────────────────────────────────────────────
-        t_mem = time.monotonic()
-        memory_facts = await self._memory.compose(
-            query=message,
-            intent=effective_intent,
-            session_id=session_id,
-        )
-        _obs.emit("memory_retrieved",
-                  facts=len(memory_facts),
-                  latency_ms=round((time.monotonic() - t_mem) * 1000))
+        # Fast-path: skip memory retrieval for short CHAT queries to avoid ChromaDB cold-start
+        word_count = len(message.strip().split())
+        if effective_intent == Intent.CHAT and word_count < 5:
+            memory_facts = []
+            _obs.emit("memory_retrieved", facts=0, latency_ms=0)
+        else:
+            # Memory retrieval
+            t_mem = time.monotonic()
+            memory_facts = await self._memory.compose(
+                query=message,
+                intent=effective_intent,
+                session_id=session_id,
+            )
+            _obs.emit("memory_retrieved",
+                      facts=len(memory_facts),
+                      latency_ms=round((time.monotonic() - t_mem) * 1000))
 
         # ── 6. Initial tool dispatch ───────────────────────────────────────
         tool_result: Optional[ToolResult] = None
