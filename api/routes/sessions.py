@@ -47,7 +47,7 @@ async def get_history(session_id: str):
     """Get full message history for a session."""
     # First check if session exists
     sessions = _store.list_sessions()
-    session_exists = any(s.id == session_id for s in sessions)
+    session_exists = any(s["id"] == session_id for s in sessions)
     
     if not session_exists:
         raise HTTPException(status_code=404, detail="Session not found")

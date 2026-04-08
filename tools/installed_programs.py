@@ -10,13 +10,22 @@ Called from tools/sysinfo.py when query mentions "installed" / "programs" / "app
 from __future__ import annotations
 import logging
 import sys
-from functools import lru_cache
+import time
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
+import time
+
+_WINDOWS_CACHE: tuple[list[dict], float] | tuple[None, float] = (None, 0.0)
+_WINDOWS_CACHE_TTL = 300  # 5 minutes — picks up mid-session installs
+
+
 def _list_windows() -> list[dict]:
+    global _WINDOWS_CACHE
+    cached, ts = _WINDOWS_CACHE
+    if cached is not None and (time.monotonic() - ts) < _WINDOWS_CACHE_TTL:
+        return cached
     try:
         import winreg
         programs = []
@@ -45,7 +54,9 @@ def _list_windows() -> list[dict]:
             if p["name"].lower() not in seen:
                 seen.add(p["name"].lower())
                 unique.append(p)
-        return sorted(unique, key=lambda x: x["name"].lower())
+        result = sorted(unique, key=lambda x: x["name"].lower())
+        _WINDOWS_CACHE = (result, time.monotonic())
+        return result
     except ImportError:
         return []
 

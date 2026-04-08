@@ -6,6 +6,7 @@ Supported formats:
     DOCX  → python-docx
     CSV   → pandas
     XLSX  → pandas + openpyxl
+    Images → OCR via pytesseract (if installed), else metadata only
     TXT / MD / code files → plain UTF-8 read
 
 Also exports parse_file() used directly by the engine for file attachments.
@@ -18,8 +19,6 @@ from pathlib import Path
 from core.models import Intent, FileAttachment, ToolResult, RiskLevel
 from tools import register_tool
 from core.config import settings
-
-# All dependencies are now managed in pyproject.toml and installed via pip
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,6 @@ async def _parse_pdf(data: bytes) -> str:
         pages = [page.get_text() for page in doc]
         text = "\n\n".join(pages)
         logger.info(f"[file_reader] PDF parsed: {len(text)} chars from {len(pages)} pages")
-        logger.info(f"[file_reader] First 200 chars: {text[:200]}")
         return text
     except Exception as e:
         logger.error(f"[file_reader] PDF parse error: {e}")
@@ -68,49 +66,33 @@ async def _parse_docx(data: bytes) -> str:
 
 
 async def _parse_image(data: bytes, filename: str) -> str:
-    """Parse image using OCR and vision model for comprehensive analysis."""
+    """Parse image using OCR. Returns extracted text and basic metadata."""
     try:
         import io
         from PIL import Image
-        import pytesseract
-        
-        # Open image from bytes
+
         image = Image.open(io.BytesIO(data))
-        
-        # Get image metadata
         width, height = image.size
         format_name = image.format
-        
-        # Extract text using OCR
+
+        ocr_text = ""
         try:
-            text = pytesseract.image_to_string(image)
+            import pytesseract
+            ocr_text = pytesseract.image_to_string(image).strip()
         except Exception as ocr_error:
-            logger.warning(f"[file_reader] OCR failed: {ocr_error}")
-            logger.info("[file_reader] Tesseract OCR not available - using vision model only")
-            text = ""
-        
-        logger.info(f"[file_reader] Image parsed: {filename} ({width}x{height}, {format_name})")
-        logger.info(f"[file_reader] Extracted text: {len(text)} chars")
-        
-        # Skip vision model for now to prevent hanging - OCR only
-        logger.info("[file_reader] Using OCR-only processing (vision model disabled)")
-        visual_description = "\n\nVisual Description: [Vision analysis temporarily disabled]"
-        
-        # Build comprehensive result
+            logger.debug(f"[file_reader] OCR unavailable: {ocr_error}")
+
         result = f"Image: {filename} ({width}x{height}, {format_name})"
-        
-        if text.strip():
-            result += f"\n\nExtracted Text:\n{text}"
+        if ocr_text:
+            result += f"\n\nExtracted Text:\n{ocr_text}"
         else:
-            result += "\n\nNo readable text found in image (OCR not available)."
-        
-        result += visual_description
-        
-        logger.info(f"[file_reader] First 200 chars of result: {result[:200]}")
+            result += "\n\nNo text could be extracted (pytesseract not installed or image has no readable text)."
+
+        logger.info(f"[file_reader] image parsed: {filename} ({width}x{height}) — {len(ocr_text)} OCR chars")
         return result
-        
+
     except Exception as e:
-        logger.error(f"[file_reader] Image parse error: {e}")
+        logger.error(f"[file_reader] image parse error: {e}")
         return f"[Image parse error: {e}]"
 
 
@@ -164,9 +146,7 @@ async def parse_file(
             text = f"[Could not read file: {e}]"
 
     chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-    logger.info(f"[file_reader] parsed {filename}: {len(text)} chars -> {len(chunks)} chunks")
-    logger.info(f"[file_reader] first chunk: {chunks[0][:200] if chunks else 'NO CHUNKS'}")
-
+    logger.info(f"[file_reader] parsed {filename}: {len(text)} chars → {len(chunks)} chunks")
     return FileAttachment(
         filename=filename,
         content_type=content_type,

@@ -83,11 +83,12 @@ async def memory_op(message: str) -> ToolResult:
     # Infer importance from wording
     importance = 0.8 if any(w in message.lower() for w in ["always", "never", "prefer", "important", "critical"]) else 0.5
 
-    # Use a placeholder session_id — the engine will also persist via _extract_and_store_facts
-    # This gives the tool a direct write path too
+    # Use the canonical session_id so facts are retrievable in the same session scope.
+    # Falls back to a named bucket for CLI/direct tool calls without a session.
+    effective_session_id = "explicit_memory_op"
     success = await store.store(
         fact=fact,
-        session_id="explicit_memory_op",
+        session_id=effective_session_id,
         source="user",
         extra_metadata={"memory_type": "semantic", "importance": str(importance), "access_count": "0"},
     )

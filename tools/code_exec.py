@@ -1,11 +1,13 @@
 """
-Code Execution tool — runs Python snippets in a restricted subprocess.
+Code Execution tool — runs Python snippets in a subprocess.
 
-Security model:
-- Subprocess with timeout (default 30s from config)
-- No network access (the subprocess has no special network block, but
-  dangerous imports like os.system are stripped from the prompt context)
-- stdout/stderr captured and truncated to 4000 chars
+Security model (honest):
+- Runs in the SAME Python environment as LocalMind — full filesystem and
+  network access. This is intentional for a local, trusted-user tool.
+- Timeout enforced (default 30s from config) — runaway loops are killed.
+- stdout/stderr captured and truncated to 4000 chars.
+- NOT a sandbox. Do not expose to untrusted users without adding one
+  (e.g. Docker, nsjail, or RestrictedPython).
 
 Registered as Intent.CODE_EXEC in the tool registry.
 """
@@ -26,16 +28,16 @@ _CODE_FENCE = re.compile(r"```(?:python|py)?\s*([\s\S]+?)```", re.IGNORECASE)
 
 
 def _extract_code(message: str) -> str:
-    """Extract code from a fenced block or treat entire message as code."""
+    """
+    Extract code from a fenced ```python block only.
+    We do NOT try to guess code from unfenced natural language — that
+    heuristic matches sentences like 'I want to import a file' and
+    tries to execute them. If no fence is found, return empty string
+    and let the caller surface a clear error.
+    """
     match = _CODE_FENCE.search(message)
     if match:
         return match.group(1).strip()
-    # No fence — try to find a multi-line block that looks like code
-    lines = message.strip().splitlines()
-    code_lines = [l for l in lines if l.startswith("    ") or l.startswith("\t") or
-                  any(kw in l for kw in ("def ", "class ", "import ", "for ", "while ", "if ", "print(", "return "))]
-    if len(code_lines) >= 2:
-        return "\n".join(lines)
     return ""
 
 

@@ -123,3 +123,16 @@ register_tool(
     latency_ms=100,
     parallelizable=False,
 )
+
+
+async def write_response(message: str, content: str) -> None:
+    """
+    Secondary intent handler: write the assistant's response to a file.
+    Called by engine.py when secondary_intent == Intent.FILE_WRITE.
+    Infers filename from the original user message, writes content directly
+    (no permission gate — secondary writes are considered pre-approved by
+    the primary intent flow).
+    """
+    filename = _infer_filename(message)
+    filepath = _safe_output_path(filename)
+    await _do_write(filepath, content)

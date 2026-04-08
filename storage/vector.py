@@ -150,7 +150,10 @@ class VectorStore:
             docs = results.get("documents", [[]])[0]
             distances = results.get("distances", [[]])[0]
             metadatas = results.get("metadatas", [[]])[0]
-            return list(zip(docs, distances, metadatas))
+            ids = results.get("ids", [[]])[0]
+            # Include document ID in metadata for updates
+            enriched_metas = [{**meta, "id": doc_id} for meta, doc_id in zip(metadatas, ids)]
+            return list(zip(docs, distances, enriched_metas))
         except Exception as e:
             logger.error(f"Vector recall_with_scores failed: {e}")
             return []
@@ -189,6 +192,17 @@ class VectorStore:
             return results.get("documents") or []
         except Exception:
             return []
+
+    async def count(self) -> int:
+        """Return total number of stored facts."""
+        client = self._get_client()
+        if not client or not self._collection:
+            return 0
+        try:
+            result = self._collection.get(include=["metadatas"])
+            return len(result.get("metadatas", []))
+        except Exception:
+            return 0
 
     async def list_all_with_metadata(self) -> list[dict]:
         """Return all facts with metadata including their IDs (F4: memory viewer)."""

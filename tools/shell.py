@@ -1,17 +1,15 @@
 """
-Shell tool — runs safe shell commands for file inspection and self-repair tasks.
+Shell tool — runs shell commands for file inspection and self-repair tasks.
 
-This is intentionally more capable than code_exec (which is Python-only).
-It allows the model to: read source files, list directories, run pip, git diff, etc.
+Security model (honest):
+- Blocklist-based — catches common dangerous patterns but is NOT a true
+  sandbox. A determined user can bypass it (e.g. python -c "import subprocess...").
+- Intended for trusted local use only. Do not expose to untrusted users.
+- Working directory locked to the project root (cannot cd above it).
+- Timeout enforced (default 30s).
+- stdout/stderr captured and returned.
 
-Security model:
-- Blocked commands: rm -rf, sudo, curl|wget to external URLs, shutdown, mkfs
-- Working directory locked to the project root (cannot cd above it)
-- Timeout enforced (default 30s)
-- stdout/stderr captured and returned
-
-Registered as Intent.SHELL in the tool registry.
-To enable: add LOCALMIND_SHELL_ENABLED=true to .env
+To enable: set LOCALMIND_SHELL_ENABLED=true in .env
 """
 from __future__ import annotations
 import asyncio
@@ -37,8 +35,10 @@ _BLOCKED_PATTERNS = [
     r"\bmkfs\b",
     r"\bdd\s+if=",
     r"\bchmod\s+777\b",
-    # Block outbound fetch — web_search tool handles that
+    # Block outbound fetch to external URLs — web_search tool handles that
     r"\b(curl|wget)\s+https?://",
+    # Block fetch to local/internal IPs too
+    r"\b(curl|wget)\s+(localhost|127\.|192\.168\.|10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[01]\.)",
     r">\s*/dev/(sda|sdb|hda)",
 ]
 

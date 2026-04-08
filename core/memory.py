@@ -13,7 +13,7 @@ Scoring formula (per audit):
 from __future__ import annotations
 import logging
 import time
-from typing import Optional
+# Use built-in generics with from __future__ import annotations
 
 from core.models import Intent
 from storage.vector import VectorStore
@@ -34,6 +34,7 @@ _MIN_QUERY_WORDS_FOR_MEMORY = 5
 
 _RELEVANCE_THRESHOLD = 0.45
 _LOOSE_THRESHOLD = 0.60     # used when memory store is small (< 10 facts)
+# NOTE: Higher threshold = less strict filtering (looser matching)
 _MAX_FACTS = 6
 _RECENCY_WINDOW_SECS = 3600 * 24 * 7   # 1 week
 _IMPORTANCE_DEFAULT = 0.5               # 0.0–1.0
@@ -46,7 +47,7 @@ class MemoryComposer:
     Score = similarity * 0.6 + recency * 0.2 + importance * 0.1 + usage_freq * 0.1
     """
 
-    def __init__(self, vector_store: Optional[VectorStore] = None):
+    def __init__(self, vector_store: VectorStore | None = None):
         self._store = vector_store or VectorStore()
 
     async def compose(
@@ -59,25 +60,29 @@ class MemoryComposer:
         if intent not in _MEMORY_RELEVANT_INTENTS:
             return []
 
-        # Skip embedding + vector search for short queries — ChromaDB cold-start
+        # Skip embedding + vector search for short CHAT queries — ChromaDB cold-start
         # is expensive (10-30s) and short messages have no meaningful matches.
-        # Always run for MEMORY_OP (explicit recall requests).
+        # Always run for MEMORY_OP, FILE_TASK, and FILE_WRITE (may need memory).
         word_count = len(query.strip().split())
-        if intent != Intent.MEMORY_OP and word_count < _MIN_QUERY_WORDS_FOR_MEMORY:
+        if intent == Intent.CHAT and word_count < _MIN_QUERY_WORDS_FOR_MEMORY:
             return []
 
         try:
             raw = await self._store.recall_with_scores(query=query, top_k=top_k * 3)
         except Exception as e:
-            logger.warning(f"Memory recall failed: {e}")
+            logger.warning("Memory recall failed: %s", e)
             return []
 
         if not raw:
             return []
 
-        # Use a looser threshold when the store is small (prevents empty memory on new installs)
-        count = len(raw)
-        threshold = _LOOSE_THRESHOLD if count < 10 else _RELEVANCE_THRESHOLD
+        # Use a looser threshold when store is small (prevents empty memory on new installs)
+        # NOTE: Need actual store size, not query result count
+        try:
+            total_facts = await self._store.count()
+        except Exception:
+            total_facts = 0  # Fallback if count() fails
+        threshold = _LOOSE_THRESHOLD if total_facts < 10 else _RELEVANCE_THRESHOLD
 
         now = time.time()
         ranked = []
@@ -87,7 +92,9 @@ class MemoryComposer:
                 continue
 
             # Factor 1: similarity (cosine, inverted)
-            similarity_score = 1.0 - distance
+            # NOTE: ChromaDB uses cosine distance (0=identical, 2=opposite)
+            # Similarity only valid for cosine distance in [0,1]; L2 distance can exceed 1.0
+            similarity_score = max(0.0, 1.0 - distance)  # Clamp to avoid negative values
 
             # Factor 2: recency (0.0–1.0, decays over the recency window)
             ts = float(metadata.get("timestamp", 0))
@@ -114,11 +121,17 @@ class MemoryComposer:
         # Increment access_count for retrieved facts (async fire-and-forget style)
         top_facts = [(fact, meta) for _, fact, meta in ranked[:top_k]]
         for fact, meta in top_facts:
+            # NOTE: update_metadata needs document ID, not fact text
+            doc_id = meta.get("id")
+            if not doc_id:
+                logger.debug("No document ID in metadata for fact: %s", fact[:50])
+                continue
             try:
                 new_count = int(meta.get("access_count", 0)) + 1
-                await self._store.update_metadata(fact, {"access_count": str(new_count)})
-            except Exception:
-                pass  # metadata update is best-effort
+                await self._store.update_metadata(doc_id, {"access_count": str(new_count)})
+            except Exception as e:
+                logger.debug("Metadata update failed for %s: %s", doc_id[:8], e)
+                # metadata update is best-effort
 
         return [fact for fact, _ in top_facts]
 
