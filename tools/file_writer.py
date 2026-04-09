@@ -53,12 +53,23 @@ def _infer_filename(message: str, lang: str = "") -> str:
 
 def _safe_output_path(filename: str, requested_dir: str = "") -> Path:
     from core.config import settings
-    home = Path(settings.localmind_home)
+    home = Path(settings.localmind_home).resolve()
+
+    def _resolve_safe(base: Path, name: str) -> Path:
+        """Resolve base/name and verify it stays inside base (prevents traversal)."""
+        resolved = (base / name).resolve()
+        if not str(resolved).startswith(str(base)):
+            raise ValueError(
+                f"Path traversal blocked: '{name}' resolves outside the allowed directory."
+            )
+        return resolved
+
     if requested_dir:
         candidate = Path(requested_dir).expanduser().resolve()
         if settings.is_path_allowed(candidate):
-            return candidate / filename
-    return home / filename
+            return _resolve_safe(candidate, filename)
+
+    return _resolve_safe(home, filename)
 
 
 async def _do_write(filepath: Path, content: str) -> ToolResult:

@@ -1,10 +1,10 @@
 """
-Ollama adapter — wraps the Ollama OpenAI-compatible API.
+Ollama adapter -- wraps the Ollama OpenAI-compatible API.
 
 Ollama exposes a REST API at http://localhost:11434 that is compatible with
 the OpenAI chat completions format. This adapter handles:
 - Streaming responses token by token
-- Connection errors with clear messages
+- Connection errors with clear user-facing messages
 - Model context window detection
 - Health checking (is Ollama running?)
 """
@@ -45,7 +45,6 @@ class OllamaAdapter(BaseAdapter):
 
     @property
     def context_window(self) -> int:
-        # Strip tag variants like :latest, :q4_0 for lookup
         base_model = self._model.split(":")[0] + ":" + self._model.split(":")[1] if ":" in self._model else self._model
         return _MODEL_CONTEXT_WINDOWS.get(self._model, _MODEL_CONTEXT_WINDOWS.get(base_model, 8192))
 
@@ -69,7 +68,7 @@ class OllamaAdapter(BaseAdapter):
                     body = await response.aread()
                     error_msg = f"Ollama returned {response.status_code}: {body.decode()[:200]}"
                     logger.error(error_msg)
-                    yield StreamChunk(text="", done=True, error=error_msg)
+                    yield StreamChunk(text=error_msg, done=True, error=error_msg)
                     return
 
                 async for line in response.aiter_lines():
@@ -94,11 +93,14 @@ class OllamaAdapter(BaseAdapter):
                 "Is Ollama running? Try: ollama serve"
             )
             logger.error(msg)
-            yield StreamChunk(text="", done=True, error=msg)
+            yield StreamChunk(text=msg, done=True, error=msg)
         except httpx.TimeoutException:
-            msg = f"Ollama request timed out after {self._timeout}s. Try a smaller model or increase OLLAMA_TIMEOUT."
+            msg = (
+                f"Ollama timed out after {self._timeout}s. "
+                "The model may still be loading -- please try again in a moment."
+            )
             logger.error(msg)
-            yield StreamChunk(text="", done=True, error=msg)
+            yield StreamChunk(text=msg, done=True, error=msg)
 
     async def health_check(self) -> bool:
         try:

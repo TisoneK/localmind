@@ -400,6 +400,13 @@ _OBVIOUS_CHAT_PATTERNS = [
     r"^(hi|hey|hello|howdy|yo|sup|greetings|good (morning|afternoon|evening|night))[\s!?.]*$",
     r"^(thanks?|thank you|thx|ty|cheers|cool|ok|okay|got it|understood|noted|sure|np|no problem)[\s!?.]*$",
     r"^(bye|goodbye|cya|see ya|later|take care|good night)[\s!?.]*$",
+    # Extended: greetings with "there", "everyone", "all", "folks", punctuation
+    r"^(hi|hey|hello|howdy|yo)\s+(there|everyone|all|folks|team|friend)[\s!?.]*$",
+    # Extended: pleasantries and acknowledgements with trailing words
+    r"^(good (morning|afternoon|evening|night))[,\s]*(everyone|all|folks|team|there)?[\s!?.]*$",
+    r"^(how are you|how are you doing|how\'?s it going|what\'?s up|wassup)[\s!?.]*$",
+    r"^(nice to meet you|pleased to meet you|great to meet you)[\s!?.]*$",
+    r"^(sounds good|sounds great|that works|perfect|great|awesome|wonderful)[\s!?.]*$",
 ]
 
 class SemanticClassifier:
@@ -485,20 +492,19 @@ class SemanticClassifier:
         if any(re.fullmatch(p, stripped, re.IGNORECASE) for p in _OBVIOUS_CHAT_PATTERNS):
             return Intent.CHAT, None, 0.95
         
-        # Fast-path: very short messages with no tool signals
+        # Fast-path: very short messages with no tool signals.
+        # Use rule-based classification instead of 7 separate model inferences —
+        # the rule-based router is instant and reliable for short queries.
         words = stripped.split()
         if len(words) <= 6 and not has_attachment:
-            has_tool_signal = any([
-                self._semantic_similarity(message, Intent.SYSINFO) > 0.7,
-                self._semantic_similarity(message, Intent.MEMORY_OP) > 0.7,
-                self._semantic_similarity(message, Intent.CODE_EXEC) > 0.7,
-                self._semantic_similarity(message, Intent.WEB_SEARCH) > 0.7,
-                self._semantic_similarity(message, Intent.FILE_WRITE) > 0.7,
-                self._semantic_similarity(message, Intent.FILE_TASK) > 0.7,
-                self._semantic_similarity(message, Intent.SHELL) > 0.7,
-            ])
-            if not has_tool_signal:
+            from core import intent_router as _ir
+            rule_primary, rule_secondary = _ir.classify_multi(message, has_attachment)
+            if rule_primary == Intent.CHAT:
+                # Rule-based is confident this is chat — no inference needed.
                 return Intent.CHAT, None, 0.85
+            # Rule-based found a non-chat intent for this short message —
+            # trust it directly (e.g. "what time is it" → SYSINFO).
+            return rule_primary, rule_secondary, 0.80
         
         # Attachment handling
         if has_attachment:

@@ -2,20 +2,25 @@
 Tool registry and dispatch layer.
 
 Tools self-register by importing their module. This __init__ imports all
-built-in tools so they're registered at startup — no manual wiring needed.
+built-in tools so they're registered at startup -- no manual wiring needed.
 
 To add a new tool:
     1. Create tools/my_tool.py
     2. Call register_tool(Intent.MY_INTENT, my_fn, description="...", cost=0.1, latency_ms=500)
-    3. Import it here
+    3. Optionally register a validator: register_validator(Intent.MY_INTENT, my_validator_fn)
+    4. Import it here
 
-The registry is then available to the engine, agent loop, and tool scorer.
+Validators run before dispatch and return a user-facing error string or None.
+This eliminates a class of confusing tool errors (e.g. "no code found") before
+they reach real I/O.
 """
 from __future__ import annotations
 import asyncio
-from core.models import Intent, ToolResult
+from typing import Callable
+from core.models import Intent, ToolResult, RiskLevel
 
 _REGISTRY: dict[Intent, dict] = {}
+_VALIDATORS: dict[Intent, Callable[[str], str | None]] = {}
 
 
 def register_tool(
@@ -37,8 +42,36 @@ def register_tool(
     }
 
 
+def register_validator(intent: Intent, fn: Callable[[str], str | None]) -> None:
+    """Register a pre-dispatch validator for an intent.
+
+    fn receives the raw message string and returns:
+      - None  if the payload is valid (dispatch proceeds normally)
+      - str   an error message shown to the user (dispatch is skipped)
+
+    Validators run synchronously before any I/O. Keep them fast.
+    """
+    _VALIDATORS[intent] = fn
+
+
 async def dispatch(intent: Intent, message: str) -> ToolResult | None:
-    """Dispatch to the registered tool for an intent. Returns None if not registered."""
+    """Dispatch to the registered tool for an intent.
+
+    Runs the pre-dispatch validator first (if one is registered).
+    Returns None if the intent has no registered handler.
+    Returns a low-risk ToolResult with the error string if validation fails.
+    """
+    # Pre-execution validation
+    validator = _VALIDATORS.get(intent)
+    if validator:
+        error = validator(message)
+        if error:
+            return ToolResult(
+                content=error,
+                risk=RiskLevel.LOW,
+                source="validator",
+            )
+
     entry = _REGISTRY.get(intent)
     if not entry:
         return None
@@ -49,7 +82,7 @@ async def dispatch_parallel(intents_and_inputs: list[tuple[Intent, str]]) -> lis
     """A3: Dispatch multiple independent tools concurrently via asyncio.gather.
 
     Tools flagged parallelizable=False (e.g. code_exec which is stateful) are
-    still run, but grouped to run after any parallel batch completes — this
+    still run, but grouped to run after any parallel batch completes -- this
     preserves execution order safety for stateful tools while still allowing
     network-bound tools (web_search, memory_op) to run concurrently.
 
@@ -105,12 +138,12 @@ def available_tools() -> list[dict]:
     ]
 
 
-# ── Auto-register all built-in tools ─────────────────────────────────────────
+# -- Auto-register all built-in tools -----------------------------------------
 # Import order matters: file_reader must be before engine uses parse_file
-from tools import file_reader   # noqa: E402, F401 — registers FILE_TASK
-from tools import web_search    # noqa: E402, F401 — registers WEB_SEARCH
-from tools import code_exec     # noqa: E402, F401 — registers CODE_EXEC
-from tools import shell         # noqa: E402, F401 — registers SHELL
-from tools import sysinfo       # noqa: E402, F401 — registers SYSINFO (offline: time, date, specs)
-from tools import memory_tool   # noqa: E402, F401 — registers MEMORY_OP
-from tools import file_writer   # noqa: E402, F401 — FILE_WRITE (secondary intent)
+from tools import file_reader   # noqa: E402, F401 -- registers FILE_TASK
+from tools import web_search    # noqa: E402, F401 -- registers WEB_SEARCH
+from tools import code_exec     # noqa: E402, F401 -- registers CODE_EXEC
+from tools import shell         # noqa: E402, F401 -- registers SHELL
+from tools import sysinfo       # noqa: E402, F401 -- registers SYSINFO (offline: time, date, specs)
+from tools import memory_tool   # noqa: E402, F401 -- registers MEMORY_OP
+from tools import file_writer   # noqa: E402, F401 -- FILE_WRITE (secondary intent)

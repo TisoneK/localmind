@@ -51,3 +51,21 @@ AGENT_INTENTS: frozenset[Intent] = frozenset({
     # Intent.SYSINFO   — instant offline tool, no loop needed
 })
 """Intents that are routed through the agent loop rather than direct dispatch."""
+
+# -- Agent tool allowlist ----------------------------------------------------
+
+AGENT_ALLOWED_TOOLS: frozenset[str] = frozenset({
+    "web_search",
+    "code_exec",
+    "file_write",
+    "file_task",
+    "shell",
+    "memory_op",
+    "sysinfo",
+})
+"""Tool names the agent loop is permitted to call via <action> blocks.
+
+Any tool name the LLM generates that is not in this set is rejected before
+dispatch with a clear observation message, preventing hallucinated tool names
+from producing confusing registry-miss errors.
+"""

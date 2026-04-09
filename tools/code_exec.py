@@ -126,3 +126,21 @@ register_tool(
     latency_ms=2000,
     parallelizable=False,  # A3: stateful subprocess — must run sequentially
 )
+
+
+# -- Pre-dispatch validator ----------------------------------------------------
+# Registered after the tool so _CODE_FENCE is already in scope.
+# This surfaces a clear user-facing message before any subprocess is spawned.
+
+def _validate_code_exec(message: str) -> str | None:
+    """Reject early if no code fence is present -- avoids a confusing tool error."""
+    if not _CODE_FENCE.search(message):
+        return (
+            "Please wrap your code in a ```python``` block so I can run it. "
+            "Example:\n```python\nprint('hello')\n```"
+        )
+    return None
+
+
+from tools import register_validator  # noqa: E402
+register_validator(Intent.CODE_EXEC, _validate_code_exec)

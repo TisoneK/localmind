@@ -299,6 +299,36 @@ class AgentLoop:
         tool_input = action_match.group(2).strip()
         logger.info(f"[agent.loop] iter={iteration + 1} tool={tool_name} input={tool_input[:80]}")
 
+        # Guard: reject tool names not in the explicit allowlist.
+        # Prevents hallucinated tool names from reaching dispatch and producing
+        # confusing "not registered" errors.
+        from core.agent.constants import AGENT_ALLOWED_TOOLS
+        if tool_name not in AGENT_ALLOWED_TOOLS:
+            allowed_list = ", ".join(sorted(AGENT_ALLOWED_TOOLS))
+            observation = (
+                f"[Tool '{tool_name}' is not available. "
+                f"Available tools: {allowed_list}]"
+            )
+            logger.warning(f"[agent.loop] hallucinated tool name: {tool_name!r}")
+            self._last_tool_failed = True
+            self._consecutive_failures = consecutive_failures_ref[0] + 1
+            self._observation_log = (
+                observation_log
+                + f"\n[Tool: {tool_name} | Status: BLOCKED (not in allowlist)]\n"
+                f"{observation}\n"
+            )
+            trace.steps.append(AgentStep(
+                iteration=iteration + 1,
+                thought=thought,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                observation=observation,
+                tool_failed=True,
+                retry_count=0,
+                latency_ms=0,
+            ))
+            return
+
         yield StreamChunk(text=f"\n### Action: `{tool_name}`\n", done=False)
         action_labels = {
             "file_write": f"Creating file: `{tool_input}`",
@@ -333,6 +363,7 @@ class AgentLoop:
 
                 # Web-search special path: write results + summary to files
                 if tool_intent == Intent.WEB_SEARCH:
+                    _ws_completed = False
                     async for chunk in self._handle_web_search_result(
                         safe_obs=safe_obs,
                         query=tool_input,
@@ -340,10 +371,21 @@ class AgentLoop:
                         iteration=iteration,
                         trace=trace,
                     ):
-                        yield chunk
-                    # Signal caller to return early
-                    yield StreamChunk(text="", done=True, error="__RETURN__")
-                    return
+                        if chunk.done and not chunk.error:
+                            # This is _handle_web_search_result's internal completion
+                            # signal (done=True, error=None). It means the file write
+                            # confirmed. Suppress forwarding it -- we'll send __RETURN__
+                            # below instead. Do NOT yield this chunk or the caller loop
+                            # receives a done=True without __RETURN__ and stalls.
+                            _ws_completed = True
+                        else:
+                            yield chunk
+                    # File write confirmed: tell the caller loop to exit cleanly.
+                    # If _handle_web_search_result threw, it yields nothing, so
+                    # _ws_completed stays False and the agent loop continues normally.
+                    if _ws_completed:
+                        yield StreamChunk(text="", done=True, error="__RETURN__")
+                        return
 
                 observation = safe_obs
                 last_tool_failed_ref[0] = False

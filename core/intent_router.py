@@ -117,7 +117,8 @@ _SEARCH_PATTERNS = [
     r"\b(search for|look up|find out|what happened|news about|google)\b",
     r"\b(who (won|lost|is leading|was elected|signed|announced))\b",
     r"\b(news|headlines|breaking news)\b",
-    r"\b(today|this week|this month)\b",
+    r"\b(what|how|who|when|where|news|update|score|price|result|weather).{0,40}\b(today|this week|this month)\b",
+    r"\b(today|this week|this month).{0,40}\b(news|update|price|score|result|weather|event|happening|forecast)\b",
 ]
 
 # Suppress search for general-knowledge questions — but only when no

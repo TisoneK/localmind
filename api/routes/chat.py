@@ -131,6 +131,10 @@ async def _event_stream(
                     yield _sse(obs_evt.to_sse_dict())
 
             if chunk.error:
+                # Render the error text to the user before closing the stream.
+                # Error chunks carry a user-facing message in chunk.text.
+                if chunk.text:
+                    yield _sse({"text": chunk.text, "done": False})
                 yield _sse({"error": chunk.error, "done": True})
                 return
 
