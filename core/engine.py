@@ -267,34 +267,20 @@ class Engine:
                       facts=len(memory_facts),
                       latency_ms=round((time.monotonic() - t_mem) * 1000))
 
-        # ── 6. Initial tool dispatch ───────────────────────────────────────
+        # ── 6. Tool dispatch ───────────────────────────────────────────
         tool_result: Optional[ToolResult] = None
-        if effective_intent not in (Intent.CHAT, Intent.FILE_TASK) or (
-            effective_intent == Intent.FILE_TASK and not has_attachment
-        ):
+        
+        # CRITICAL: FILE_TASK and SHELL must always call real tools - never allow LLM fabrication
+        # These intents are handled directly, NOT through agent loop
+        if effective_intent in (Intent.FILE_TASK, Intent.SHELL):
+            logger.info(f"[engine] Direct tool dispatch for {effective_intent.value} - preventing hallucination")
             t_tool = time.monotonic()
             try:
                 tool_result = await dispatch(effective_intent, message)
-
-                # ── Permission gate short-circuit ──────────────────────────
-                if tool_result and tool_result.requires_confirmation:
-                    _obs.emit("permission_required",
-                              tool=effective_intent.value,
-                              pending_path=tool_result.metadata.get("pending_path", ""),
-                              pending_content=tool_result.metadata.get("pending_content", ""),
-                              filename=tool_result.metadata.get("filename", ""))
-                    yield StreamChunk(text=tool_result.content, done=False)
-                    yield StreamChunk(text="", done=True)
-                    self._store.append(session_id, Message(role=Role.USER, content=message))
-                    return
-
-                # Filter injection from tool output before it enters LLM context
+                
+                # Filter injection from tool output
                 if tool_result and tool_result.content:
-                    filtered_content = (
-                        _filter_code_output(tool_result.content)
-                        if effective_intent == Intent.CODE_EXEC
-                        else _filter_tool_injection(tool_result.content)
-                    )
+                    filtered_content = _filter_tool_injection(tool_result.content)
                     tool_result = ToolResult(
                         content=filtered_content,
                         risk=tool_result.risk,
@@ -302,48 +288,25 @@ class Engine:
                         metadata=tool_result.metadata if hasattr(tool_result, "metadata") else {},
                         requires_confirmation=tool_result.requires_confirmation,
                     )
-
-                tool_ok = (
-                    tool_result is not None
-                    and tool_result.content.strip()
-                    and tool_result.content.strip() != "No results found."
-                )
+                
                 tool_latency = round((time.monotonic() - t_tool) * 1000)
-                _obs.emit("tool_dispatched",
-                          tool=effective_intent.value,
-                          success=tool_ok,
-                          latency_ms=tool_latency)
-                record_tool_outcome(self._store, effective_intent.value,
-                                    success=tool_ok, latency_ms=tool_latency)
-                self._metrics.record(effective_intent.value, latency_ms=tool_latency, success=tool_ok)
-
-                if not tool_ok:
-                    logger.warning(
-                        f"[engine] tool {effective_intent.value} returned empty/failed — using fallback"
-                    )
-                    if effective_intent == Intent.WEB_SEARCH:
-                        tool_result = ToolResult(
-                            content=(
-                                "I'm unable to search the web right now. This could be due to:\n"
-                                "- No internet connection\n"
-                                "- Search service temporarily unavailable\n\n"
-                                "Please try again or check your connection."
-                            ),
-                            risk=RiskLevel.LOW,
-                            source="web_search_error",
-                        )
-                    else:
-                        tool_result = None
-                        effective_intent = Intent.CHAT
-
+                _obs.emit("tool_dispatched", tool=effective_intent.value, success=bool(tool_result), latency_ms=tool_latency)
+                record_tool_outcome(self._store, effective_intent.value, success=bool(tool_result), latency_ms=tool_latency)
+                self._metrics.record(effective_intent.value, latency_ms=tool_latency, success=bool(tool_result))
+                
             except Exception as e:
-                tool_latency = round((time.monotonic() - t_tool) * 1000)
-                logger.warning(f"Tool dispatch failed for {effective_intent}: {e}")
+                logger.error(f"Direct tool dispatch failed for {effective_intent.value}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])
-                record_tool_outcome(self._store, effective_intent.value,
-                                    success=False, latency_ms=tool_latency)
-                self._metrics.record(effective_intent.value, latency_ms=tool_latency, success=False)
-                effective_intent = Intent.CHAT
+                tool_result = None
+        
+        # Agent intents (WEB_SEARCH, CODE_EXEC, FILE_WRITE, MEMORY_OP) get tool result in agent loop
+        elif effective_intent in AGENT_INTENTS:
+            # No initial dispatch - agent loop handles it
+            pass
+        
+        # CHAT and other intents get no tool result
+        else:
+            tool_result = None
 
         # ── 7. Build context ───────────────────────────────────────────────
         ctx = EngineContext(

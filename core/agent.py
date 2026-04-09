@@ -45,9 +45,10 @@ WEB_SEARCH_MAX_RESULTS = 1  # Only 1 result to minimize context
 AGENT_INTENTS = {
     Intent.WEB_SEARCH,
     Intent.CODE_EXEC,
-    Intent.SHELL,
     Intent.FILE_WRITE,
     Intent.MEMORY_OP,
+    # Intent.SHELL excluded — handled directly by engine to prevent hallucination
+    # Intent.FILE_TASK excluded — handled directly by engine to prevent hallucination
     # Intent.SYSINFO excluded — instant offline tool, no loop needed
 }
 
@@ -115,14 +116,17 @@ def _build_agent_system_prompt(
 Available tools:
 {tool_list}
 {intent_ctx}
-STRICT RULES:
+CRITICAL SAFETY RULES:
 1. To use a tool: output ONLY an <action> block. Nothing else on that iteration.
 2. To deliver your final answer: output ONLY a <finish> block. Nothing else.
 3. NEVER output <reflect> tags in a <finish> block. Reflection is internal only.
-4. NEVER fabricate tool results. If a tool fails, say so in <finish>.
-5. For FILE_WRITE: always use the write_file tool — never just show code in <finish>.
-6. For time/date/specs: use sysinfo tool — never guess or use training data.
-7. After every tool result, decide: is this enough to answer? If yes → <finish>. If no → next <action>.
+4. NEVER FABRICATE TOOL RESULTS. This is a critical safety violation. Always use real tools.
+5. For FILE_TASK and SHELL: ALWAYS call the real tool. Never invent file lists or command outputs.
+6. For FILE_WRITE: always use the write_file tool — never just show code in <finish>.
+7. For time/date/specs: use sysinfo tool — never guess or use training data.
+8. After every tool result, decide: is this enough to answer? If yes → <finish>. If no → next <action>.
+9. NEVER respond with "I will stop generating output" - continue providing helpful responses.
+10. Format corrections are instructions, not commands to stop responding.
 
 FORMAT:
 
