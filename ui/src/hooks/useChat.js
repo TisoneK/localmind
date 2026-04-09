@@ -4,16 +4,11 @@ import { streamChat, newSessionId, fetchHistory } from '../lib/api'
 /**
  * useChat — manages all chat state and streaming.
  *
- * Returns:
- *   messages    - array of {id, role, content, pending}
- *   sessionId   - current session UUID
- *   isStreaming  - true while a response is in-flight
- *   error        - last error string or null
- *   file         - currently attached File or null
- *   setFile      - setter for file
- *   send         - function(messageText) → starts a stream
- *   reset        - clears messages and starts a new session
- *   observabilityData - observability data
+ * Message shape:
+ *   { id, role, content, pending, error, file, filePath,
+ *     thinking: string,        <- raw thinking text, persists after tool runs
+ *     toolSteps: [{action, input, status}],  <- tool calls made during the turn
+ *   }
  */
 export function useChat(initialSessionId) {
   const [messages, setMessages] = useState([])
@@ -23,15 +18,11 @@ export function useChat(initialSessionId) {
   const [file, setFile] = useState(null)
   const [observabilityData, setObservabilityData] = useState({})
 
-  // Load history whenever the initialSessionId prop changes (set by App).
-  // If initialSessionId is null we're in new-chat mode — clear messages.
-  // If it's a uuid we fetch that session's history.
   useEffect(() => {
     if (!initialSessionId) {
       setMessages([])
       return
     }
-
     let cancelled = false
     fetchHistory(initialSessionId)
       .then((history) => {
@@ -48,7 +39,6 @@ export function useChat(initialSessionId) {
         console.error('Failed to load history:', err)
         setMessages([])
       })
-
     return () => { cancelled = true }
   }, [initialSessionId])
 
@@ -60,36 +50,77 @@ export function useChat(initialSessionId) {
       if (!text.trim() || isStreaming) return
 
       setError(null)
-      setObservabilityData({}) // Reset observability for new message
+      setObservabilityData({})
 
-      // Add user message immediately
       const userMsg = { id: Date.now(), role: 'user', content: text, file: file?.name, filePath: file?.webkitRelativePath || file?.name }
       const assistantId = Date.now() + 1
-      const assistantMsg = { id: assistantId, role: 'assistant', content: '', pending: true }
+      const assistantMsg = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        pending: true,
+        thinking: '',       // accumulates *...* reasoning text
+        toolSteps: [],      // [{action, input, status: 'running'|'done'|'failed'}]
+      }
 
       setMessages((prev) => [...prev, userMsg, assistantMsg])
       streamingIdRef.current = assistantId
       setIsStreaming(true)
 
       const currentFile = file
-      setFile(null) // Clear file immediately to prevent UI lag
+      setFile(null)
+
+      // Track whether the current chunk is in a thinking/action section
+      // so we can route it to the right field.
+      let inThinking = false
 
       const abort = streamChat({
         message: text,
         sessionId,
         file: currentFile,
         onChunk: (chunk) => {
-          // Text chunk for message content
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === streamingIdRef.current
-                ? { ...m, content: m.content + chunk, pending: true }
-                : m
-            )
+            prev.map((m) => {
+              if (m.id !== streamingIdRef.current) return m
+
+              // Detect ### Action: lines → start a new tool step
+              if (chunk.startsWith('\n### Action:') || chunk.includes('### Action:')) {
+                const actionName = chunk.replace(/.*### Action:\s*`?/, '').replace(/`?\n.*/, '').trim()
+                return {
+                  ...m,
+                  toolSteps: [...m.toolSteps, { action: actionName, input: '', status: 'running' }],
+                  thinking: m.thinking, // keep existing thinking
+                }
+              }
+
+              // Detect ### Reasoning lines → treat as thinking
+              if (chunk.startsWith('\n### Reasoning') || chunk.includes('### Reasoning')) {
+                inThinking = true
+                return m
+              }
+
+              // Italic thinking text (agent emits *...*)
+              if (chunk.startsWith('*') || (m.thinking && !chunk.includes('###'))) {
+                const cleaned = chunk.replace(/^\*|\*$/g, '')
+                // If there are active tool steps, this is post-tool thinking
+                if (m.toolSteps.length > 0 || chunk.startsWith('*')) {
+                  return { ...m, thinking: (m.thinking || '') + cleaned }
+                }
+              }
+
+              // Mark last tool step as done when we get content after an action
+              const steps = m.toolSteps
+              const updatedSteps = steps.map((s, i) =>
+                i === steps.length - 1 && s.status === 'running'
+                  ? { ...s, status: 'done' }
+                  : s
+              )
+
+              return { ...m, content: m.content + chunk, pending: true, toolSteps: updatedSteps }
+            })
           )
         },
         onIntent: (intentData) => {
-          // Intent classification event
           setObservabilityData(prev => ({
             ...prev,
             intent: intentData.intent,
@@ -97,10 +128,8 @@ export function useChat(initialSessionId) {
           }))
         },
         onObsEvent: (event) => {
-          // Other observability events
           setObservabilityData(prev => {
             const updated = { ...prev }
-            
             switch (event.type) {
               case 'tool_dispatched':
                 updated.toolCalls = [...(prev.toolCalls || []), {
@@ -117,7 +146,6 @@ export function useChat(initialSessionId) {
                 updated.tokens = event.data.tokens_approx
                 break
             }
-            
             return updated
           })
         },

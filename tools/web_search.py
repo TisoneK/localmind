@@ -18,12 +18,25 @@ SNIPPET_MAX = 300
 
 
 async def _search_ddg(query: str) -> list[dict]:
+    import asyncio
     try:
         from ddgs import DDGS
         safe_query = query.encode("utf-8", errors="replace").decode("utf-8")
-        with DDGS() as ddgs:
-            results = list(ddgs.text(safe_query, max_results=MAX_RESULTS))
+
+        def _run_sync():
+            with DDGS() as ddgs:
+                return list(ddgs.text(safe_query, max_results=MAX_RESULTS))
+
+        # DDGS is synchronous and blocks the event loop. Run it in a thread
+        # with a hard timeout so a slow/hung search never stalls the server.
+        results = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _run_sync),
+            timeout=12,
+        )
         return results
+    except asyncio.TimeoutError:
+        logger.warning("[web_search] DDG timed out after 12s")
+        return []
     except Exception as e:
         error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
         logger.warning(f"[web_search] DDG failed: {error_msg}")
