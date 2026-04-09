@@ -23,30 +23,34 @@ export function useChat(initialSessionId) {
   const [file, setFile] = useState(null)
   const [observabilityData, setObservabilityData] = useState({})
 
-  // Load history when session ID changes
+  // Load history whenever the initialSessionId prop changes (set by App).
+  // If initialSessionId is null we're in new-chat mode — clear messages.
+  // If it's a uuid we fetch that session's history.
   useEffect(() => {
-    const loadHistory = async () => {
-      // Don't load history if we're starting fresh (initialSessionId is null) or sessionId is null
-      if (sessionId && initialSessionId !== null) {
-        try {
-          const history = await fetchHistory(sessionId)
-          setMessages(history.map((msg, index) => ({
-            id: index,
-            role: msg.role,
-            content: msg.content,
-            timestamp: msg.timestamp
-          })))
-        } catch (err) {
-          console.error('Failed to load history:', err)
-          setMessages([])
-        }
-      } else {
-        setMessages([])
-      }
+    if (!initialSessionId) {
+      setMessages([])
+      return
     }
 
-    loadHistory()
-  }, [sessionId, initialSessionId])
+    let cancelled = false
+    fetchHistory(initialSessionId)
+      .then((history) => {
+        if (cancelled) return
+        setMessages(history.map((msg, index) => ({
+          id: index,
+          role: msg.role,
+          content: msg.content,
+          timestamp: msg.timestamp,
+        })))
+      })
+      .catch((err) => {
+        if (cancelled) return
+        console.error('Failed to load history:', err)
+        setMessages([])
+      })
+
+    return () => { cancelled = true }
+  }, [initialSessionId])
 
   const abortRef = useRef(null)
   const streamingIdRef = useRef(null)

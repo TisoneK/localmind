@@ -1,9 +1,23 @@
-import { useState, useEffect } from 'react'
-import { fetchSessions, deleteSession } from '../lib/api'
+/**
+ * Sidebar — v0.5
+ *
+ * Sessions list is now passed in as props (fetched by App via useSession).
+ * Sidebar no longer owns a fetch — it's a pure display + interaction component.
+ *
+ * Props:
+ *   sessionId        — currently active session UUID (or null for new-chat)
+ *   sessions         — array from useSession
+ *   onSessionSelect  — (session) => void
+ *   onSessionDelete  — (deletedId) => void  ← NEW: App handles state transition
+ *   onNewChat        — () => void
+ *   onRefresh        — () => void  (called after delete to refresh list)
+ */
+import { useState } from 'react'
+import { deleteSession } from '../lib/api'
 
 const S = {
-  sidebar: (isMinimized) => ({
-    width: isMinimized ? '60px' : '280px',
+  sidebar: (minimized) => ({
+    width: minimized ? '60px' : '280px',
     background: '#0a0a10',
     borderRight: '1px solid #1a1a26',
     display: 'flex',
@@ -11,16 +25,8 @@ const S = {
     height: '100%',
     transition: 'width 0.2s ease-in-out',
   }),
-  header: {
-    padding: '16px',
-    borderBottom: '1px solid #1a1a26',
-  },
-  title: {
-    fontSize: '14px',
-    fontWeight: '600',
-    color: '#9090a8',
-    marginBottom: '12px',
-  },
+  header: { padding: '16px', borderBottom: '1px solid #1a1a26' },
+  title: { fontSize: '14px', fontWeight: '600', color: '#9090a8', marginBottom: '12px' },
   newChatBtn: {
     width: '100%',
     background: '#22c55e',
@@ -32,23 +38,17 @@ const S = {
     cursor: 'pointer',
     fontWeight: '500',
   },
-  sessionList: {
-    flex: 1,
-    overflowY: 'auto',
-    padding: '8px',
-  },
-  sessionItem: (isActive) => ({
+  sessionList: { flex: 1, overflowY: 'auto', padding: '8px' },
+  sessionItem: (active) => ({
     padding: '10px 12px',
     borderRadius: '6px',
     cursor: 'pointer',
     marginBottom: '4px',
-    background: isActive ? '#1e1e2e' : 'transparent',
-    border: isActive ? '1px solid #2a2a3e' : '1px solid transparent',
+    background: active ? '#1e1e2e' : 'transparent',
+    border: active ? '1px solid #2a2a3e' : '1px solid transparent',
     transition: 'background 0.15s, border 0.15s',
   }),
-  sessionItemHover: {
-    background: '#1a1a26',
-  },
+  sessionItemHover: { background: '#1a1a26' },
   sessionTitle: {
     fontSize: '13px',
     color: '#e2e2e8',
@@ -64,7 +64,7 @@ const S = {
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  deleteBtn: {
+  deleteBtn: (hovered) => ({
     background: 'none',
     border: 'none',
     color: '#6b6b7a',
@@ -72,18 +72,10 @@ const S = {
     fontSize: '10px',
     padding: '2px 6px',
     borderRadius: '3px',
-    opacity: 0,
+    opacity: hovered ? 0.7 : 0,
     transition: 'opacity 0.15s',
-  },
-  sessionItemHovering: {
-    opacity: 0.7,
-  },
-  empty: {
-    padding: '20px',
-    textAlign: 'center',
-    color: '#6b6b7a',
-    fontSize: '12px',
-  },
+  }),
+  empty: { padding: '20px', textAlign: 'center', color: '#6b6b7a', fontSize: '12px' },
   collapsed: {
     padding: '12px 8px',
     display: 'flex',
@@ -102,34 +94,20 @@ const S = {
     transition: 'color 0.15s',
     alignSelf: 'flex-end',
   },
-  toggleBtnHover: {
-    color: '#e2e2e8',
-  },
-  collapsedSession: {
+  collapsedSession: (active) => ({
     width: '40px',
     height: '40px',
     borderRadius: '6px',
-    background: '#1e1e2e',
-    border: '1px solid #2a2a3e',
+    background: active ? '#3730a3' : '#1e1e2e',
+    border: active ? '1px solid #4f46e5' : '1px solid #2a2a3e',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     fontSize: '10px',
-    color: '#6b6b7a',
+    color: active ? '#e2e2e8' : '#6b6b7a',
     transition: 'all 0.15s',
-    position: 'relative',
-  },
-  collapsedSessionActive: {
-    background: '#3730a3',
-    borderColor: '#4f46e5',
-    color: '#e2e2e8',
-  },
-  collapsedSessionHover: {
-    background: '#2a2a3e',
-    borderColor: '#3a3a4e',
-    color: '#9090a8',
-  },
+  }),
   newChatBtnCollapsed: {
     width: '40px',
     height: '40px',
@@ -142,178 +120,67 @@ const S = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    transition: 'all 0.15s',
-  },
-  newChatBtnCollapsedHover: {
-    background: '#16a34a',
-    borderColor: '#16a34a',
   },
 }
 
-export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
-  const [sessions, setSessions] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [hoveredSession, setHoveredSession] = useState(null)
+function formatTime(timestamp) {
+  if (!timestamp) return '—'
+  const date = new Date(timestamp)
+  if (isNaN(date.getTime())) return '—'
+  const diffMins = Math.floor((Date.now() - date) / 60000)
+  if (diffMins < 1) return 'just now'
+  if (diffMins < 60) return `${diffMins}m ago`
+  if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`
+  return `${Math.floor(diffMins / 1440)}d ago`
+}
+
+export function Sidebar({
+  sessionId,
+  sessions = [],
+  onSessionSelect,
+  onSessionDelete,
+  onNewChat,
+  onRefresh,
+}) {
   const [isMinimized, setIsMinimized] = useState(false)
-  const [hoveredCollapsed, setHoveredCollapsed] = useState(null)
+  const [hoveredSession, setHoveredSession] = useState(null)
 
-  const loadSessions = async () => {
-    try {
-      console.log('Loading sessions...')
-      const data = await fetchSessions()
-      console.log('Sessions loaded:', data)
-      setSessions(data || [])
-    } catch (err) {
-      console.error('Failed to load sessions:', err)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    console.log('Sidebar mounting, loading sessions')
-    loadSessions()
-  }, []) // load on mount
-
-  // Also refresh when sessionId changes (for new/delete operations)
-  useEffect(() => {
-    if (sessionId) {
-      console.log('Session changed, refreshing sessions list')
-      loadSessions()
-    }
-  }, [sessionId])
-
-  const handleDeleteSession = async (e, sessionIdToDelete) => {
+  const handleDelete = async (e, id) => {
     e.stopPropagation()
-    
-    // Optimistically remove from local state
-    setSessions(prev => prev.filter(s => s.id !== sessionIdToDelete))
-    
     try {
-      await deleteSession(sessionIdToDelete)
-      
-      // If we deleted the current session, create a new one immediately
-      if (sessionIdToDelete === sessionId) {
-        // Clear saved session from localStorage immediately
-        try {
-          localStorage.removeItem('localmind_current_session')
-        } catch (err) {
-          console.warn('Failed to clear session from localStorage:', err)
-        }
-        
-        // Create new chat immediately without setTimeout
-        onNewChat()
-      }
+      await deleteSession(id)
     } catch (err) {
       console.error('Failed to delete session:', err)
-      // Revert on failure
-      loadSessions()
+    } finally {
+      // Notify App of deletion (App decides what to do with session state)
+      onSessionDelete?.(id)
+      // Refresh the list
+      onRefresh?.()
     }
-  }
-
-  const handleSessionClick = (session) => {
-    onSessionSelect(session)
-  }
-
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '—'
-    const date = new Date(timestamp)
-    if (isNaN(date.getTime())) return '—'
-    
-    const now = new Date()
-    const diffMs = now - date
-    const diffMins = Math.floor(diffMs / 60000)
-    
-    if (diffMins < 1) return 'just now'
-    if (diffMins < 60) return `${diffMins}m ago`
-    if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`
-    return `${Math.floor(diffMins / 1440)}d ago`
-  }
-
-  if (loading) {
-    return (
-      <div style={S.sidebar(isMinimized)}>
-        {isMinimized ? (
-          <div style={S.collapsed}>
-            <button
-              style={S.toggleBtn}
-              onClick={() => setIsMinimized(false)}
-              title="Expand sidebar"
-            >
-              »
-            </button>
-            <div style={{ fontSize: '10px', color: '#6b6b7a' }}>...</div>
-          </div>
-        ) : (
-          <div style={S.header}>
-            <div style={S.title}>Sessions</div>
-            <button
-              style={S.toggleBtn}
-              onClick={() => setIsMinimized(true)}
-              title="Minimize sidebar"
-            >
-              «
-            </button>
-          </div>
-        )}
-      </div>
-    )
   }
 
   if (isMinimized) {
     return (
       <div style={S.sidebar(true)}>
         <div style={S.collapsed}>
-          <button
-            style={S.toggleBtn}
-            onClick={() => setIsMinimized(false)}
-            title="Expand sidebar"
-          >
+          <button style={S.toggleBtn} onClick={() => setIsMinimized(false)} title="Expand sidebar">
             »
           </button>
-          
-          <button
-            style={S.newChatBtnCollapsed}
-            onClick={onNewChat}
-            title="New chat"
-            onMouseEnter={(e) => {
-              e.target.style.background = '#16a34a'
-              e.target.style.borderColor = '#16a34a'
-            }}
-            onMouseLeave={(e) => {
-              e.target.style.background = '#22c55e'
-              e.target.style.borderColor = '#22c55e'
-            }}
-          >
+          <button style={S.newChatBtnCollapsed} onClick={onNewChat} title="New chat">
             +
           </button>
-          
-          {sessions.slice(0, 8).map((session) => {
-            const isActive = session.id === sessionId
-            const isHovered = hoveredCollapsed === session.id
-            
-            return (
-              <div
-                key={session.id}
-                style={{
-                  ...S.collapsedSession,
-                  ...(isActive ? S.collapsedSessionActive : {}),
-                  ...(isHovered && !isActive ? S.collapsedSessionHover : {}),
-                }}
-                onClick={() => handleSessionClick(session)}
-                onMouseEnter={() => setHoveredCollapsed(session.id)}
-                onMouseLeave={() => setHoveredCollapsed(null)}
-                title={`${session.title || session.id?.slice(0, 8) || 'Untitled'} (${session.message_count || 0} msgs)`}
-              >
-                {session.title ? session.title.charAt(0).toUpperCase() : session.id?.slice(0, 1).toUpperCase() || '?'}
-              </div>
-            )
-          })}
-          
-          {sessions.length > 8 && (
-            <div style={{ fontSize: '10px', color: '#6b6b7a', textAlign: 'center' }}>
-              +{sessions.length - 8} more
+          {sessions.slice(0, 8).map((session) => (
+            <div
+              key={session.id}
+              style={S.collapsedSession(session.id === sessionId)}
+              onClick={() => onSessionSelect(session)}
+              title={`${session.title || session.id?.slice(0, 8) || 'Untitled'} (${session.message_count || 0} msgs)`}
+            >
+              {(session.title || session.id || '?').charAt(0).toUpperCase()}
             </div>
+          ))}
+          {sessions.length > 8 && (
+            <div style={{ fontSize: '10px', color: '#6b6b7a' }}>+{sessions.length - 8} more</div>
           )}
         </div>
       </div>
@@ -328,8 +195,8 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
           style={S.toggleBtn}
           onClick={() => setIsMinimized(true)}
           title="Minimize sidebar"
-          onMouseEnter={(e) => e.target.style.color = '#e2e2e8'}
-          onMouseLeave={(e) => e.target.style.color = '#6b6b7a'}
+          onMouseEnter={(e) => (e.target.style.color = '#e2e2e8')}
+          onMouseLeave={(e) => (e.target.style.color = '#6b6b7a')}
         >
           «
         </button>
@@ -337,23 +204,19 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
           + New Chat
         </button>
       </div>
-      
+
       <div style={S.sessionList}>
         {sessions.length === 0 ? (
           <div style={S.empty}>No sessions yet</div>
         ) : (
           sessions.map((session) => {
-            const isActive = session.id === sessionId
-            const isHovered = hoveredSession === session.id
-            
+            const active = session.id === sessionId
+            const hovered = hoveredSession === session.id
             return (
               <div
                 key={session.id}
-                style={{
-                  ...S.sessionItem(isActive),
-                  ...(isHovered && !isActive ? S.sessionItemHover : {}),
-                }}
-                onClick={() => handleSessionClick(session)}
+                style={{ ...S.sessionItem(active), ...(hovered && !active ? S.sessionItemHover : {}) }}
+                onClick={() => onSessionSelect(session)}
                 onMouseEnter={() => setHoveredSession(session.id)}
                 onMouseLeave={() => setHoveredSession(null)}
                 title={session.title}
@@ -365,11 +228,8 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
                   <span>{session.message_count || 0} msgs</span>
                   <span>{formatTime(session.last_active)}</span>
                   <button
-                    style={{
-                      ...S.deleteBtn,
-                      ...(isHovered ? S.sessionItemHovering : {}),
-                    }}
-                    onClick={(e) => handleDeleteSession(e, session.id)}
+                    style={S.deleteBtn(hovered)}
+                    onClick={(e) => handleDelete(e, session.id)}
                     title="Delete session"
                   >
                     ×

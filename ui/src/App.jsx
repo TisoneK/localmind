@@ -1,45 +1,28 @@
-import { useState, useEffect } from 'react'
-import { StatusBar } from './components/StatusBar'
-import { Sidebar } from './components/Sidebar'
-import { MessageList } from './components/MessageList'
-import { ChatInput } from './components/ChatInput'
-import { ErrorBanner } from './components/ErrorBanner'
-import { ObservabilityPanel } from './components/ObservabilityPanel'
-import { useChat } from './hooks/useChat'
-import { fetchHistory } from './lib/api'
-import { useHealth } from '../hooks/useHealth'
-import { useSession } from '../hooks/useSession'
-
-// localStorage utilities for session persistence
-const STORAGE_KEY = 'localmind_current_session'
-const saveCurrentSession = (sessionId) => {
-  try {
-    if (sessionId) {
-      localStorage.setItem(STORAGE_KEY, sessionId)
-    } else {
-      localStorage.removeItem(STORAGE_KEY)
-    }
-  } catch (err) {
-    console.warn('Failed to save session to localStorage:', err)
-  }
-}
-
-const loadCurrentSession = () => {
-  try {
-    return localStorage.getItem(STORAGE_KEY)
-  } catch (err) {
-    console.warn('Failed to load session from localStorage:', err)
-    return null
-  }
-}
-
-const clearCurrentSession = () => {
-  try {
-    localStorage.removeItem(STORAGE_KEY)
-  } catch (err) {
-    console.warn('Failed to clear session from localStorage:', err)
-  }
-}
+/**
+ * App.jsx — v0.5
+ *
+ * Session state is owned here and follows a simple state machine:
+ *
+ *   null          → "new chat" mode (no session selected, no history loaded)
+ *   string (uuid) → active session, history loaded / loading
+ *
+ * Rules:
+ *   - On startup: always null (new chat mode, never auto-select last session)
+ *   - New Chat button: set to null
+ *   - Session selected from sidebar: set to that UUID
+ *   - Session deleted: if it was active, set to null
+ *   - sessionId from useChat: NEVER auto-overwrites currentSessionId
+ *     (that was the root cause of the auto-selection bug — removed entirely)
+ */
+import { useState, useCallback } from 'react'
+import { StatusBar }           from './components/StatusBar'
+import { Sidebar }             from './components/Sidebar'
+import { MessageList }         from './components/MessageList'
+import { ChatInput }           from './components/ChatInput'
+import { ErrorBanner }         from './components/ErrorBanner'
+import { ObservabilityPanel }  from './components/ObservabilityPanel'
+import { useChat }             from './hooks/useChat'
+import { useSession }          from './hooks/useSession'
 
 const S = {
   root: {
@@ -49,16 +32,22 @@ const S = {
     overflow: 'hidden',
     background: '#0f0f12',
   },
+  body: { display: 'flex', flex: 1, overflow: 'hidden' },
+  main: { flex: 1, display: 'flex', flexDirection: 'column' },
 }
 
 export default function App() {
-  // Always start with new chat, don't load saved session on startup
+  /**
+   * currentSessionId: single source of truth.
+   * null  = new-chat mode (startup default)
+   * uuid  = explicit user selection or first-send promotion
+   */
   const [currentSessionId, setCurrentSessionId] = useState(null)
-  const { refreshSessions, sessions } = useSession()
-  
+  const { sessions, refreshSessions } = useSession()
+
   const {
     messages,
-    sessionId,
+    sessionId,      // internal uuid for the active stream
     isStreaming,
     error,
     file,
@@ -67,68 +56,60 @@ export default function App() {
     reset,
     cancelStream,
     observabilityData,
-  } = useChat(null) // Always start with fresh session
+  } = useChat(currentSessionId)
 
-  // Set initial session when useChat creates one
-  useEffect(() => {
-    console.log('Initial session effect:', { sessionId, currentSessionId })
-    if (sessionId && currentSessionId === null) {
-      console.log('Setting initial session:', sessionId)
+  // ── Session actions ──────────────────────────────────────────────────────
+
+  const handleNewChat = useCallback(() => {
+    setCurrentSessionId(null)
+    reset()
+    refreshSessions()
+  }, [reset, refreshSessions])
+
+  const handleSessionSelect = useCallback((session) => {
+    if (session.id === currentSessionId) return
+    setCurrentSessionId(session.id)
+  }, [currentSessionId])
+
+  const handleSessionDelete = useCallback((deletedId) => {
+    if (deletedId === currentSessionId) {
+      setCurrentSessionId(null)
+      reset()
+    }
+    refreshSessions()
+  }, [currentSessionId, reset, refreshSessions])
+
+  /**
+   * Intercept first send in new-chat mode:
+   * promote useChat's internal sessionId to currentSessionId so the
+   * sidebar highlights the newly created session.
+   * This is the ONLY path where useChat's sessionId flows into App state.
+   */
+  const handleSend = useCallback((text) => {
+    send(text)
+    if (currentSessionId === null) {
       setCurrentSessionId(sessionId)
-      saveCurrentSession(sessionId)
+      refreshSessions()
     }
-  }, [sessionId])
-
-  // Sync session ID between sidebar and chat, save to localStorage
-  useEffect(() => {
-    console.log('Sync effect:', { sessionId, currentSessionId })
-    if (sessionId !== currentSessionId && currentSessionId !== null) {
-      console.log('Syncing session ID:', sessionId)
-      setCurrentSessionId(sessionId)
-      saveCurrentSession(sessionId)
-    }
-  }, [sessionId, currentSessionId])
-
-  const handleSessionSelect = async (session) => {
-    const newSessionId = session.id
-    if (newSessionId === currentSessionId) return
-    
-    setCurrentSessionId(newSessionId)
-    saveCurrentSession(newSessionId) // Save selected session
-    // Load history for the selected session
-    try {
-      const history = await fetchHistory(newSessionId)
-      // The useChat hook will handle loading the history
-    } catch (err) {
-      console.error('Failed to load session history:', err)
-    }
-  }
-
-  const handleNewChat = () => {
-    console.log('handleNewChat called')
-    // Clear any saved session to ensure fresh start
-    clearCurrentSession()
-    const newSessionId = reset()
-    console.log('New session created:', newSessionId)
-    setCurrentSessionId(newSessionId)
-    saveCurrentSession(newSessionId) // Save new session
-    // Sidebar will auto-refresh when sessionId changes
-  }
+  }, [send, currentSessionId, sessionId, refreshSessions])
 
   return (
     <div style={S.root}>
-      <StatusBar onNewChat={handleNewChat} sessionId={currentSessionId} />
+      <StatusBar onNewChat={handleNewChat} sessionId={currentSessionId || sessionId} />
       <ErrorBanner error={error} onDismiss={() => {}} />
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <Sidebar 
+      <div style={S.body}>
+        <Sidebar
           sessionId={currentSessionId}
+          sessions={sessions}
           onSessionSelect={handleSessionSelect}
+          onSessionDelete={handleSessionDelete}
           onNewChat={handleNewChat}
+          onRefresh={refreshSessions}
         />
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <div style={S.main}>
           <MessageList messages={messages} />
           <ChatInput
-            onSend={send}
+            onSend={handleSend}
             isStreaming={isStreaming}
             onStop={cancelStream}
             file={file}
