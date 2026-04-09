@@ -80,12 +80,11 @@ def create_app() -> FastAPI:
                 from storage.vector import VectorStore
                 logger.info("[startup] pre-warming VectorStore...")
                 vector_store = VectorStore()
-                client = vector_store._get_client()
-                if client:
+                if vector_store._ready:
                     count = await vector_store.count()
                     logger.info(f"[startup] VectorStore ready — {count} facts stored")
                 else:
-                    logger.info("[startup] VectorStore not available")
+                    logger.info("[startup] VectorStore not ready")
             except Exception as e:
                 logger.warning(f"[startup] VectorStore warm-up failed: {e}")
         
