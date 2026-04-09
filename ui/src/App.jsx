@@ -10,6 +10,37 @@ import { fetchHistory } from './lib/api'
 import { useHealth } from '../hooks/useHealth'
 import { useSession } from '../hooks/useSession'
 
+// localStorage utilities for session persistence
+const STORAGE_KEY = 'localmind_current_session'
+const saveCurrentSession = (sessionId) => {
+  try {
+    if (sessionId) {
+      localStorage.setItem(STORAGE_KEY, sessionId)
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  } catch (err) {
+    console.warn('Failed to save session to localStorage:', err)
+  }
+}
+
+const loadCurrentSession = () => {
+  try {
+    return localStorage.getItem(STORAGE_KEY)
+  } catch (err) {
+    console.warn('Failed to load session from localStorage:', err)
+    return null
+  }
+}
+
+const clearCurrentSession = () => {
+  try {
+    localStorage.removeItem(STORAGE_KEY)
+  } catch (err) {
+    console.warn('Failed to clear session from localStorage:', err)
+  }
+}
+
 const S = {
   root: {
     display: 'flex',
@@ -21,8 +52,9 @@ const S = {
 }
 
 export default function App() {
+  // Always start with new chat, don't load saved session on startup
   const [currentSessionId, setCurrentSessionId] = useState(null)
-  const { refreshSessions } = useSession()
+  const { refreshSessions, sessions } = useSession()
   
   const {
     messages,
@@ -35,21 +67,34 @@ export default function App() {
     reset,
     cancelStream,
     observabilityData,
-  } = useChat(currentSessionId)
+  } = useChat(null) // Always start with fresh session
 
-  // Sync session ID between sidebar and chat
+  // Set initial session when useChat creates one
   useEffect(() => {
-    if (sessionId !== currentSessionId) {
+    console.log('Initial session effect:', { sessionId, currentSessionId })
+    if (sessionId && currentSessionId === null) {
+      console.log('Setting initial session:', sessionId)
       setCurrentSessionId(sessionId)
-      refreshSessions() // Refresh to get updated session titles
+      saveCurrentSession(sessionId)
     }
-  }, [sessionId, refreshSessions])
+  }, [sessionId])
+
+  // Sync session ID between sidebar and chat, save to localStorage
+  useEffect(() => {
+    console.log('Sync effect:', { sessionId, currentSessionId })
+    if (sessionId !== currentSessionId && currentSessionId !== null) {
+      console.log('Syncing session ID:', sessionId)
+      setCurrentSessionId(sessionId)
+      saveCurrentSession(sessionId)
+    }
+  }, [sessionId, currentSessionId])
 
   const handleSessionSelect = async (session) => {
     const newSessionId = session.id
     if (newSessionId === currentSessionId) return
     
     setCurrentSessionId(newSessionId)
+    saveCurrentSession(newSessionId) // Save selected session
     // Load history for the selected session
     try {
       const history = await fetchHistory(newSessionId)
@@ -60,9 +105,14 @@ export default function App() {
   }
 
   const handleNewChat = () => {
+    console.log('handleNewChat called')
+    // Clear any saved session to ensure fresh start
+    clearCurrentSession()
     const newSessionId = reset()
+    console.log('New session created:', newSessionId)
     setCurrentSessionId(newSessionId)
-    refreshSessions() // Refresh session list to get the new session title
+    saveCurrentSession(newSessionId) // Save new session
+    // Sidebar will auto-refresh when sessionId changes
   }
 
   return (

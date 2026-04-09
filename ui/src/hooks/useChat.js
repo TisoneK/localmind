@@ -26,7 +26,8 @@ export function useChat(initialSessionId) {
   // Load history when session ID changes
   useEffect(() => {
     const loadHistory = async () => {
-      if (sessionId) {
+      // Don't load history if we're starting fresh (initialSessionId is null) or sessionId is null
+      if (sessionId && initialSessionId !== null) {
         try {
           const history = await fetchHistory(sessionId)
           setMessages(history.map((msg, index) => ({
@@ -45,7 +46,7 @@ export function useChat(initialSessionId) {
     }
 
     loadHistory()
-  }, [sessionId])
+  }, [sessionId, initialSessionId])
 
   const abortRef = useRef(null)
   const streamingIdRef = useRef(null)

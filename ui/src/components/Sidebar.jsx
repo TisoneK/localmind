@@ -159,7 +159,9 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
 
   const loadSessions = async () => {
     try {
+      console.log('Loading sessions...')
       const data = await fetchSessions()
+      console.log('Sessions loaded:', data)
       setSessions(data || [])
     } catch (err) {
       console.error('Failed to load sessions:', err)
@@ -169,8 +171,17 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
   }
 
   useEffect(() => {
+    console.log('Sidebar mounting, loading sessions')
     loadSessions()
-  }, [sessionId]) // re-fetch when active session changes
+  }, []) // load on mount
+
+  // Also refresh when sessionId changes (for new/delete operations)
+  useEffect(() => {
+    if (sessionId) {
+      console.log('Session changed, refreshing sessions list')
+      loadSessions()
+    }
+  }, [sessionId])
 
   const handleDeleteSession = async (e, sessionIdToDelete) => {
     e.stopPropagation()
@@ -181,8 +192,16 @@ export function Sidebar({ sessionId, onSessionSelect, onNewChat }) {
     try {
       await deleteSession(sessionIdToDelete)
       
-      // If we deleted the current session, create a new one
+      // If we deleted the current session, create a new one immediately
       if (sessionIdToDelete === sessionId) {
+        // Clear saved session from localStorage immediately
+        try {
+          localStorage.removeItem('localmind_current_session')
+        } catch (err) {
+          console.warn('Failed to clear session from localStorage:', err)
+        }
+        
+        // Create new chat immediately without setTimeout
         onNewChat()
       }
     } catch (err) {
