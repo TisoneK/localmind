@@ -161,5 +161,25 @@ class MemoryComposer:
     async def list_all(self) -> list[str]:
         return await self._store.list_all()
 
+    async def search(self, query: str, session_id: str, top_k: int = 3) -> list[object]:
+        """Search for similar facts and return objects with content attribute for deduplication."""
+        # Use the vector store directly to get fact+metadata tuples
+        try:
+            raw = await self._store.recall_with_scores(query=query, top_k=top_k)
+        except Exception as e:
+            logger.warning("Memory search failed: %s", e)
+            return []
+        
+        # Create objects with content attribute
+        results = []
+        for fact, distance, metadata in raw:
+            # Create a simple object with content attribute
+            class FactResult:
+                def __init__(self, content: str):
+                    self.content = content
+            results.append(FactResult(fact))
+        
+        return results
+
     async def list_all_with_metadata(self) -> list[dict]:
         return await self._store.list_all_with_metadata()
