@@ -74,25 +74,25 @@ def create_app() -> FastAPI:
     async def startup():
         logger.info(f"LocalMind — model: {settings.ollama_model} | ui: {UI_HTML.exists()}")
         
-        # Background task to pre-warm ChromaDB to avoid cold-start delays
-        async def warm_chromadb():
+        # Background task to pre-warm VectorStore
+        async def warm_vector_store():
             try:
                 from storage.vector import VectorStore
-                logger.info("[startup] pre-warming ChromaDB...")
+                logger.info("[startup] pre-warming VectorStore...")
                 vector_store = VectorStore()
                 client = vector_store._get_client()
                 if client:
                     count = await vector_store.count()
-                    logger.info(f"[startup] ChromaDB ready — {count} facts stored")
+                    logger.info(f"[startup] VectorStore ready — {count} facts stored")
                 else:
-                    logger.info("[startup] ChromaDB not available (chromadb not installed)")
+                    logger.info("[startup] VectorStore not available")
             except Exception as e:
-                logger.warning(f"[startup] ChromaDB warm-up failed: {e}")
+                logger.warning(f"[startup] VectorStore warm-up failed: {e}")
         
-        # Start ChromaDB warm-up in background
+        # Start VectorStore warm-up in background
         import asyncio
         background_tasks = set()
-        task = asyncio.create_task(warm_chromadb())
+        task = asyncio.create_task(warm_vector_store())
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
         

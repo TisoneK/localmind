@@ -2,7 +2,7 @@
 API integration tests — v0.3
 
 Covers: chat SSE streaming, sessions CRUD, health endpoint, tool registry.
-Engine is mocked so tests run without Ollama or ChromaDB.
+Engine is mocked so tests run without Ollama.
 """
 from __future__ import annotations
 import json

@@ -73,7 +73,6 @@ class Settings(BaseSettings):
     # Storage — default to ~/LocalMind/
     localmind_home: str = Field(default_factory=_default_home)
     localmind_db_path: str = ""          # resolved at startup if empty
-    localmind_chroma_path: str = ""      # resolved at startup if empty
     localmind_uploads_path: str = Field(default_factory=_default_uploads)
 
     # File reader
@@ -114,8 +113,6 @@ class Settings(BaseSettings):
         Path(self.localmind_uploads_path).mkdir(parents=True, exist_ok=True)
         if not self.localmind_db_path:
             self.localmind_db_path = str(home / "localmind.db")
-        if not self.localmind_chroma_path:
-            self.localmind_chroma_path = str(home / "chroma_db")
 
     def allowed_read_paths(self) -> list[Path]:
         return [Path(p) for p in _allowed_user_folders()]

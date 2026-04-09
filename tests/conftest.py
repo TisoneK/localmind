@@ -24,9 +24,9 @@ def tmp_db(tmp_path):
 
 
 @pytest.fixture
-def tmp_chroma(tmp_path):
-    """Return a path to a temporary ChromaDB directory."""
-    return str(tmp_path / "chroma")
+def tmp_db(tmp_path):
+    """Return a path to a temporary SQLite database file."""
+    return str(tmp_path / "test.db")
 
 
 @pytest.fixture

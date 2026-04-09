@@ -47,7 +47,7 @@ dependencies = [
     "ddgs>=6.1.0",
 
     # Memory / Storage
-    "chromadb>=0.5.0",
+    "sqlite-vec>=0.1.6",
 
     # Validation
     "pydantic>=2.7.0",

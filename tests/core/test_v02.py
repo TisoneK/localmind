@@ -67,7 +67,7 @@ class TestVectorStore:
         store._client = None
         store._collection = None
 
-        # When chromadb is not available, should return []
+        # When vector store is unavailable, should return []
         with patch("storage.vector.VectorStore._get_client", return_value=None):
             result = await store.recall_with_scores("test query")
         assert result == []

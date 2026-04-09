@@ -18,8 +18,7 @@ from core.config import settings
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-_store = VectorStore(persist_dir=settings.localmind_chroma_path
-                     if hasattr(settings, "localmind_chroma_path") else None)
+_store = VectorStore()
 
 
 # ── GET /api/memory ───────────────────────────────────────────────────────

@@ -27,9 +27,7 @@ _MEMORY_RELEVANT_INTENTS = {
     Intent.FILE_WRITE,
 }
 
-# Don't bother embedding and searching for very short conversational messages.
-# These can't have meaningful memory matches and triggering ChromaDB here
-# causes the cold-start embedding load (10-30s) on simple greetings.
+# Skip embedding for very short conversational messages — no meaningful matches.
 _MIN_QUERY_WORDS_FOR_MEMORY = 5
 
 _RELEVANCE_THRESHOLD = 0.45
@@ -60,9 +58,8 @@ class MemoryComposer:
         if intent not in _MEMORY_RELEVANT_INTENTS:
             return []
 
-        # Skip embedding + vector search for short CHAT queries — ChromaDB cold-start
-        # is expensive (10-30s) and short messages have no meaningful matches.
-        # Always run for MEMORY_OP, FILE_TASK, and FILE_WRITE (may need memory).
+        # Skip embedding for short CHAT queries — no meaningful matches.
+        # Always run for MEMORY_OP, FILE_TASK, and FILE_WRITE.
         word_count = len(query.strip().split())
         if intent == Intent.CHAT and word_count < _MIN_QUERY_WORDS_FOR_MEMORY:
             return []
@@ -92,8 +89,7 @@ class MemoryComposer:
                 continue
 
             # Factor 1: similarity (cosine, inverted)
-            # NOTE: ChromaDB uses cosine distance (0=identical, 2=opposite)
-            # Similarity only valid for cosine distance in [0,1]; L2 distance can exceed 1.0
+            # sqlite-vec distances are normalised to [0,1] in VectorStore
             similarity_score = max(0.0, 1.0 - distance)  # Clamp to avoid negative values
 
             # Factor 2: recency (0.0–1.0, decays over the recency window)

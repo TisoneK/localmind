@@ -250,7 +250,7 @@ class Engine:
             )
 
         # ── 5. Memory retrieval ────────────────────────────────────────────
-        # Fast-path: skip memory retrieval for short CHAT queries to avoid ChromaDB cold-start
+        # Fast-path: skip memory retrieval for short CHAT queries (no meaningful matches)
         word_count = len(message.strip().split())
         if effective_intent == Intent.CHAT and word_count < 5:
             memory_facts = []
