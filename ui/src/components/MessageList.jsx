@@ -93,7 +93,7 @@ export function MessageList({ messages }) {
           <div>
             {msg.file && (
               <div style={{ textAlign: msg.role === 'user' ? 'right' : 'left' }}>
-                <span style={S.fileBadge}>📎 {msg.file}</span>
+                <span style={S.fileBadge}>{msg.file} - {msg.filePath}</span>
               </div>
             )}
             <div style={S.bubble(msg.role, msg.error)}>

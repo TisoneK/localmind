@@ -34,11 +34,11 @@ CREATE TABLE IF NOT EXISTS messages (
     role        TEXT    NOT NULL CHECK(role IN ('user','assistant','system','tool')),
     content     TEXT    NOT NULL,
     tool_name   TEXT,
-    timestamp   REAL    NOT NULL DEFAULT (unixepoch('now'))
+    timestamp   REAL    NOT NULL DEFAULT (strftime('%J', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session
-    ON messages(session_id, timestamp);
+ON messages(session_id, timestamp);
 
 -- A4: Dynamic reliability tracking for tool scorer
 CREATE TABLE IF NOT EXISTS tool_stats (
@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS tool_stats (
     success_count   INTEGER NOT NULL DEFAULT 0,
     failure_count   INTEGER NOT NULL DEFAULT 0,
     total_latency_ms INTEGER NOT NULL DEFAULT 0
+);
+
+-- Migration tracking
+CREATE TABLE IF NOT EXISTS migration_history (
+    name TEXT PRIMARY KEY
 );
 """
 
@@ -74,7 +79,34 @@ class SessionStore:
     def _init_db(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
-        logger.debug(f"SQLite store ready at {self._path}")
+            # Apply migrations
+            self._apply_migrations(conn)
+            logger.debug(f"SQLite store ready at {self._path}")
+
+    def _apply_migrations(self, conn):
+        """Apply any pending migrations from the migrations directory."""
+        from pathlib import Path
+        
+        migrations_dir = Path(__file__).parent / "migrations"
+        migration_files = sorted(f for f in migrations_dir.glob("*.sql"))
+        
+        for migration_file in migration_files:
+            migration_name = migration_file.name
+            with open(migration_file, 'r') as f:
+                migration_sql = f.read()
+                # Check if migration already applied
+                cursor = conn.execute("SELECT name FROM migration_history")
+                migration_rows = cursor.fetchall()
+                existing_migrations = {row[0] for row in migration_rows} if migration_rows else set()
+                
+                if migration_name not in existing_migrations:
+                    logger.info(f"Applying migration: {migration_name}")
+                    conn.executescript(migration_sql)
+                    conn.execute("INSERT INTO migration_history (name) VALUES (?)", (migration_name,))
+                    conn.commit()
+                    logger.info(f"Migration {migration_name} applied successfully")
+                else:
+                    logger.info(f"Migration {migration_name} already applied, skipping")
 
     def ensure_session(self, session_id: str) -> None:
         with self._conn() as conn:
@@ -88,8 +120,8 @@ class SessionStore:
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO messages(session_id, role, content, tool_name, timestamp)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO messages(session_id, role, content, tool_name, timestamp, file_name, file_path, file_size, file_type)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -97,6 +129,10 @@ class SessionStore:
                     message.content,
                     message.tool_name,
                     message.timestamp or time.time(),
+                    message.file_name,
+                    message.file_path,
+                    message.file_size,
+                    message.file_type,
                 ),
             )
 
@@ -104,7 +140,7 @@ class SessionStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT role, content, tool_name, timestamp
+                SELECT role, content, tool_name, timestamp, file_name, file_path, file_size, file_type
                 FROM messages
                 WHERE session_id = ?
                 ORDER BY timestamp ASC
@@ -119,6 +155,10 @@ class SessionStore:
                 content=row["content"],
                 tool_name=row["tool_name"],
                 timestamp=row["timestamp"],
+                file_name=row["file_name"] if "file_name" in row.keys() else None,
+                file_path=row["file_path"] if "file_path" in row.keys() else None,
+                file_size=row["file_size"] if "file_size" in row.keys() else None,
+                file_type=row["file_type"] if "file_type" in row.keys() else None,
             )
             for row in rows
         ]

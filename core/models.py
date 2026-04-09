@@ -38,6 +38,10 @@ class Message(BaseModel):
     content: str
     timestamp: float = Field(default_factory=time.time)
     tool_name: Optional[str] = None
+    file_name: Optional[str] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    file_type: Optional[str] = None
 
 
 class FileAttachment(BaseModel):

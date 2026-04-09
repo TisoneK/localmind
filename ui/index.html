@@ -536,6 +536,21 @@
   .file-remove { cursor: pointer; color: var(--text3); transition: color 0.1s; padding: 0 4px; }
   .file-remove:hover { color: var(--red); }
 
+  .msg-file {
+    font-size: 11px;
+    color: var(--accent);
+    background: rgba(96, 165, 250, 0.1);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin-bottom: 6px;
+    display: inline-block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+
   .input-row { display: flex; align-items: flex-end; gap: 8px; padding: 8px 10px; }
 
   #msg-input {
@@ -1207,6 +1222,9 @@ let streaming = false;
 let streamReader = null;       // F9: hold reader ref for cancel
 let pendingFileBytes = null;
 let pendingFileName = null;
+let pendingFilePath = null;  // full path when browser exposes it
+let pendingFileSize = null;  // file size in bytes
+let pendingFileType = null;  // file MIME type
 let deleteTargetId = null;
 let obsCollapsed = window.innerWidth < 900;
 let msgHistory = [];           // F7: ↑ fill previous message
@@ -1254,6 +1272,14 @@ function renderMarkdown(text) {
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
 
 // ── Session management ────────────────────────────────────────────────────
@@ -1327,7 +1353,15 @@ async function loadSession(id) {
     if (!r.ok) return;
     const history = await r.json();
     document.getElementById('empty-state').style.display = 'none';
-    history.forEach(msg => appendMessage(msg.role, msg.content, { timestamp: msg.timestamp }));
+    history.forEach(msg => appendMessage(msg.role, msg.content, { 
+  timestamp: msg.timestamp,
+  file: msg.file_name ? {
+    name: msg.file_name,
+    path: msg.file_path,
+    size: msg.file_size,
+    type: msg.file_type
+  } : null
+}));
     scrollToBottom();
   } catch(e) { console.warn('Could not load history', e); }
 }
@@ -1366,14 +1400,15 @@ async function confirmDelete() {
 }
 
 // ── File handling ──────────────────────────────────────────────────────────
-let pendingFilePath = null;  // full path when browser exposes it
-
 function handleFile(input) {
   const file = input.files ? input.files[0] : input;
   if (!file) return;
   pendingFileName = file.name;
   // Browsers expose webkitRelativePath or path in some Electron/desktop contexts
   pendingFilePath = file.path || file.webkitRelativePath || null;
+  // Store file metadata for display
+  pendingFileSize = file.size;
+  pendingFileType = file.type || 'unknown';
   const reader = new FileReader();
   reader.onload = e => { pendingFileBytes = e.target.result; };
   reader.readAsArrayBuffer(file);
@@ -1390,6 +1425,8 @@ function clearFile() {
   pendingFileBytes = null;
   pendingFileName = null;
   pendingFilePath = null;
+  pendingFileSize = null;
+  pendingFileType = null;
   document.getElementById('file-input').value = '';
   const previewEl = document.getElementById('file-preview');
   if (previewEl) {
@@ -1513,7 +1550,15 @@ async function sendMessage() {
   setStreamingState(true);
   clearObsPanel();
 
-  appendMessage('user', text);
+  // Store file info for display before clearing
+  const fileInfo = pendingFileName ? { 
+    name: pendingFileName, 
+    path: pendingFilePath,
+    size: pendingFileSize,
+    type: pendingFileType
+  } : null;
+  
+  appendMessage('user', text, { file: fileInfo });
 
   const row = appendMessage('assistant', '', { streaming: true });
   const contentEl = row.querySelector('.msg-content');
@@ -1589,14 +1634,18 @@ async function sendMessage() {
       // Don't set Content-Type header - browser will set it correctly for FormData
     });
 
+    // Clear file after upload starts to prevent UI lag
+    if (pendingFileBytes && pendingFileName) {
+      clearFile();
+    }
+
     if (!response.ok) {
       if (statusEl && statusEl._timerInterval) {
         clearInterval(statusEl._timerInterval);
       }
       statusEl?.remove();
       contentEl.innerHTML = `Error ${response.status}: ${await response.text()}`;
-      // Clear file on error
-      if (pendingFileBytes && pendingFileName) clearFile();
+      // File clearing is now handled immediately after sending in sendMessage()
       return;
     }
 
@@ -1715,20 +1764,7 @@ async function sendMessage() {
              addMessageToolbar(row, rawText);
              // Render file links from tool metadata
              if (data.file_path) renderFileLink(row, data.file_path, data.file_name);
-             // Clear file after successful processing
-             console.log('About to clear file - pendingFileBytes:', !!pendingFileBytes, 'pendingFileName:', !!pendingFileName);
-             if (pendingFileBytes && pendingFileName) {
-               console.log('Calling clearFile()');
-               clearFile();
-             } else {
-               console.log('Not clearing file - no file data present');
-             }
-             
-             // Also clear file on first text chunk to ensure UI is responsive
-             if (data.text && !firstToken && pendingFileBytes && pendingFileName) {
-               console.log('Clearing file on first text chunk');
-               clearFile();
-             }
+             // File clearing is now handled immediately after sending in sendMessage()
              await loadSessions();
              break outer;
            }
@@ -1742,8 +1778,7 @@ async function sendMessage() {
       }
       statusEl?.remove();
       contentEl.innerHTML = `Connection error: ${e.message}`;
-      // Clear file on connection error
-      if (pendingFileBytes && pendingFileName) clearFile();
+      // File clearing is now handled immediately after sending in sendMessage()
     }
   } finally {
     setStreamingState(false);
@@ -1773,12 +1808,32 @@ function appendMessage(role, content, opts = {}) {
   const ts = opts.timestamp ? new Date(opts.timestamp * 1000) : (role === 'user' ? new Date() : null);
   const timeStr = ts ? ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '…';
 
+  // Add file display if present
+  let fileDisplay = '';
+  if (opts.file && opts.file.name) {
+    let displayText = '';
+    if (opts.file.path) {
+      // Full path available - show path
+      displayText = `${opts.file.name} - ${opts.file.path}`;
+    } else if (opts.file.size && opts.file.type) {
+      // No path available - show file size and type
+      const sizeStr = formatBytes(opts.file.size);
+      const typeStr = opts.file.type !== 'unknown' ? opts.file.type.split('/')[1] || opts.file.type : 'unknown type';
+      displayText = `${opts.file.name} - ${sizeStr} (${typeStr})`;
+    } else {
+      // Fallback to just filename
+      displayText = opts.file.name;
+    }
+    fileDisplay = `<div class="msg-file"> ${displayText}</div>`;
+  }
+
   body.innerHTML = `
     <div class="msg-meta">
       <span class="msg-role">${role === 'user' ? 'you' : 'localmind'}</span>
       <span class="msg-time" data-pending="${role === 'assistant' && !opts.timestamp ? '1' : ''}">${timeStr}</span>
     </div>
-    <div class="msg-content">${opts.streaming ? '' : renderMarkdown(content)}</div>`;
+    <div class="msg-content">${opts.streaming ? '' : renderMarkdown(content)}</div>
+    ${fileDisplay}`;
 
   row.appendChild(avatar);
   row.appendChild(body);

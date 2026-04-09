@@ -60,6 +60,10 @@ async def get_history(session_id: str):
             "content": m.content,
             "timestamp": m.timestamp,
             "tool_name": m.tool_name,
+            "file_name": m.file_name,
+            "file_path": m.file_path,
+            "file_size": m.file_size,
+            "file_type": m.file_type,
         }
         for m in messages
     ]

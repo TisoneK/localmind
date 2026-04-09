@@ -58,7 +58,7 @@ export function useChat(initialSessionId) {
       setObservabilityData({}) // Reset observability for new message
 
       // Add user message immediately
-      const userMsg = { id: Date.now(), role: 'user', content: text, file: file?.name }
+      const userMsg = { id: Date.now(), role: 'user', content: text, file: file?.name, filePath: file?.webkitRelativePath || file?.name }
       const assistantId = Date.now() + 1
       const assistantMsg = { id: assistantId, role: 'assistant', content: '', pending: true }
 
@@ -67,7 +67,7 @@ export function useChat(initialSessionId) {
       setIsStreaming(true)
 
       const currentFile = file
-      setFile(null) // clear after send
+      setFile(null) // Clear file immediately to prevent UI lag
 
       const abort = streamChat({
         message: text,

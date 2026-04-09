@@ -55,6 +55,22 @@ async def _event_stream(
     file_name_written = None
     captured_intent = None
 
+    # Store user message with file information
+    from storage.db import SessionStore
+    from core.models import Message, Role
+
+    store = SessionStore(settings.localmind_db_path)
+    user_message = Message(
+        role=Role.USER,
+        content=message,
+        file_name=filename,
+        file_path=file_full_path,
+        file_size=len(file_bytes) if file_bytes else None,
+        file_type=content_type
+    )
+    store.append(session_id, user_message)
+    logger.info(f"Stored user message with file: {filename}")
+
     try:
         async for chunk in _engine.process(
             message=message,
@@ -157,7 +173,8 @@ async def _event_stream(
                     store.update_session_title(session_id, smart_title)
                     logger.info(f"FALLBACK TITLE UPDATE: '{smart_title}' (replaced: '{current_title}')")
             except Exception as e:
-                logger.warning(f"Failed to update fallback title: {e}")
+                logger.error(f"Stream error: {e}", exc_info=True)
+                yield _sse({"error": str(e), "done": True})
 
     except Exception as e:
         logger.error(f"Stream error: {e}", exc_info=True)
