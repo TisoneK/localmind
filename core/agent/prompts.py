@@ -39,11 +39,24 @@ def build_agent_system_prompt(
             "Use this as a prior when interpreting follow-up messages.\n"
         )
 
+    shell_guidance = ""
+    if intent == Intent.SHELL:
+        shell_guidance = """
+SHELL TOOL GUIDANCE:
+- The shell tool handles everyday computer tasks: browsing files, opening apps, checking disk space, etc.
+- When the tool returns a result, respond naturally as a helpful assistant — not as a terminal.
+- Good finish example for a file listing:
+    "Here's what's in your Documents folder: [summarise what the tool returned, highlight anything notable]"
+- If the tool returned an error, explain it plainly: "I couldn't find your Documents folder — it may be in a different location on your computer."
+- Never echo raw tool output verbatim. Interpret it for the user.
+- Keep your tone friendly and conversational, as if helping a non-technical person.
+"""
+
     return f"""You are LocalMind's reasoning agent. You have tools available and MUST use them — never simulate or guess tool results.
 
 Available tools:
 {tool_list}
-{intent_ctx}
+{intent_ctx}{shell_guidance}
 CRITICAL SAFETY RULES:
 1. To use a tool: output ONLY an <action> block. Nothing else on that iteration.
 2. To deliver your final answer: output ONLY a <finish> block. Nothing else.

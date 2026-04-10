@@ -29,6 +29,7 @@ Improvements over v0.3:
 - Token approximation uses char-based heuristic with script-aware fallback note
 """
 from __future__ import annotations
+import asyncio
 import logging
 import time
 from typing import AsyncIterator, Optional
@@ -53,6 +54,28 @@ from adapters import get_adapter
 from tools import dispatch, available_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_task(coro) -> asyncio.Task:
+    """
+    Schedule a fire-and-forget coroutine as an asyncio Task.
+
+    Replaces bare ensure_future/create_task calls throughout the engine.
+    Differences from raw create_task:
+      - Uses create_task (explicit, Python 3.7+ standard — no loop ambiguity).
+      - Wraps the coroutine so any unhandled exception is logged rather than
+        silently discarded.  Without this wrapper, exceptions in background
+        tasks produce an "unhandled exception in task" warning at GC time —
+        after the traceback context is gone — making them nearly impossible
+        to diagnose in production.
+    """
+    async def _wrapper():
+        try:
+            await coro
+        except Exception:
+            logger.exception("Background task failed")
+
+    return asyncio.create_task(_wrapper())
 
 # Max entries kept in per-session intent history window fed to AgentLoop
 INTENT_HISTORY_WINDOW = 5
@@ -360,19 +383,28 @@ class Engine:
                     except Exception as e:
                         logger.warning(f"Secondary FILE_WRITE failed: {e}")
                 case Intent.MEMORY_OP:
-                    # Secondary memory op: treat the full user message as a fact candidate
-                    await self._extract_and_store_facts(message, session_id, _obs)
+                    # Secondary memory op — fire-and-forget, same as primary path
+                    _safe_task(
+                        self._extract_and_store_facts(message, session_id, _obs)
+                    )
                 case _:
                     logger.debug(
                         f"[engine] secondary intent {secondary_intent.value} — no handler, skipping"
                     )
 
         # ── 9. Memory persistence ──────────────────────────────────────────
+        # Both storage calls are fire-and-forget: they must not block the
+        # caller (client is waiting for stream close / next request).
+        # _safe_task logs any exceptions — no silent data loss.
         if effective_intent == Intent.MEMORY_OP:
-            await self._extract_and_store_facts(message, session_id, _obs)
+            _safe_task(
+                self._extract_and_store_facts(message, session_id, _obs)
+            )
 
-        # Post-response memory: assistant's own answer can surface new facts
-        await self._maybe_store_response_facts(response_text, session_id, _obs)
+        # Post-response memory: assistant's own answer can surface new facts.
+        _safe_task(
+            self._maybe_store_response_facts(response_text, session_id, _obs)
+        )
 
         # ── 10. Persist history ────────────────────────────────────────────
         self._store.append(session_id, Message(role=Role.USER, content=message))
