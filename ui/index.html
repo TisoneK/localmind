@@ -1697,9 +1697,27 @@ async function sendMessage() {
               if (textEl) textEl.textContent = 'Blocked';
             }
             if (!firstToken) {
-              // Only update intent/confidence pills before first real content
+              // Update intent/confidence pills before first real content
               if (evt.type === 'intent_classified') {
                 updateSessionPills(evt.data?.primary, evt.data?.confidence);
+                // ── Fix: stop showing "Thinking…" the moment intent is known.
+                // For CHAT fast-path, intent_classified fires before the LLM call,
+                // so this prevents a 5–30s blank "Thinking…" wait on local models.
+                const intentLabel = {
+                  chat:       'Generating…',
+                  web_search: 'Searching…',
+                  code_exec:  'Running code…',
+                  file_write: 'Writing file…',
+                  file_task:  'Reading file…',
+                  memory_op:  'Recalling…',
+                  sysinfo:    'Checking system…',
+                  shell:      'Running command…',
+                }[evt.data?.primary] || 'Processing…';
+                if (textEl) {
+                  textEl.textContent = intentLabel;
+                  textEl.style.color = 'var(--text2)';
+                }
+                if (detailsEl) detailsEl.textContent = evt.data?.primary || '';
               }
             }
             // Permission gate — render confirm/deny UI

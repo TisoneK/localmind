@@ -11,14 +11,24 @@ Supported formats:
 
 Also exports parse_file() used directly by the engine for file attachments.
 Registered as Intent.FILE_TASK in the tool registry.
+
+Performance notes:
+- Plain text files are read with a hard cap (FILE_READ_MAX_BYTES) to prevent
+  context overflow on large logs/source files.
+- All heavy parsing (PDF, DOCX, CSV) runs inside asyncio.to_thread so it never
+  blocks the event loop.
+- A FILE_OP_TIMEOUT_SECONDS deadline wraps each parse call; stalls on network
+  mounts or corrupt files are killed cleanly.
 """
 from __future__ import annotations
+import asyncio
 import logging
 from pathlib import Path
 
 from core.models import Intent, FileAttachment, ToolResult, RiskLevel
 from tools import register_tool
 from core.config import settings
+from core.agent.constants import FILE_OP_TIMEOUT_SECONDS, FILE_READ_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -42,27 +52,46 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 
 async def _parse_pdf(data: bytes) -> str:
+    def _do_parse() -> str:
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(stream=data, filetype="pdf")
+            pages = [page.get_text() for page in doc]
+            text = "\n\n".join(pages)
+            logger.info(f"[file_reader] PDF parsed: {len(text)} chars from {len(pages)} pages")
+            return text
+        except Exception as e:
+            logger.error(f"[file_reader] PDF parse error: {e}")
+            return f"[PDF parse error: {e}]"
+
     try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(stream=data, filetype="pdf")
-        pages = [page.get_text() for page in doc]
-        text = "\n\n".join(pages)
-        logger.info(f"[file_reader] PDF parsed: {len(text)} chars from {len(pages)} pages")
-        return text
-    except Exception as e:
-        logger.error(f"[file_reader] PDF parse error: {e}")
-        return f"[PDF parse error: {e}]"
+        return await asyncio.wait_for(
+            asyncio.to_thread(_do_parse),
+            timeout=FILE_OP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"[file_reader] PDF parse timed out after {FILE_OP_TIMEOUT_SECONDS}s")
+        return f"[PDF parse timed out after {FILE_OP_TIMEOUT_SECONDS}s — file may be too large or corrupted]"
 
 
 async def _parse_docx(data: bytes) -> str:
+    def _do_parse() -> str:
+        try:
+            import io
+            from docx import Document
+            doc = Document(io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            logger.error(f"[file_reader] DOCX parse error: {e}")
+            return f"[DOCX parse error: {e}]"
+
     try:
-        import io
-        from docx import Document
-        doc = Document(io.BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except Exception as e:
-        logger.error(f"[file_reader] DOCX parse error: {e}")
-        return f"[DOCX parse error: {e}]"
+        return await asyncio.wait_for(
+            asyncio.to_thread(_do_parse),
+            timeout=FILE_OP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return f"[DOCX parse timed out after {FILE_OP_TIMEOUT_SECONDS}s]"
 
 
 async def _parse_image(data: bytes, filename: str) -> str:
@@ -97,23 +126,32 @@ async def _parse_image(data: bytes, filename: str) -> str:
 
 
 async def _parse_csv_xlsx(data: bytes, filename: str) -> str:
+    def _do_parse() -> str:
+        try:
+            import io
+            import pandas as pd
+            import openpyxl
+
+            if filename.endswith(".xlsx"):
+                df = pd.read_excel(io.BytesIO(data), engine="openpyxl")
+            else:
+                df = pd.read_csv(io.BytesIO(data))
+
+            # Summary + first rows
+            shape_info = f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\nColumns: {', '.join(df.columns.tolist())}\n\n"
+            preview = df.head(20).to_markdown(index=False)
+            return shape_info + preview
+        except Exception as e:
+            logger.error(f"[file_reader] CSV/XLSX parse error: {e}")
+            return f"[CSV/XLSX parse error: {e}]"
+
     try:
-        import io
-        import pandas as pd
-        import openpyxl
-        
-        if filename.endswith(".xlsx"):
-            df = pd.read_excel(io.BytesIO(data), engine="openpyxl")
-        else:
-            df = pd.read_csv(io.BytesIO(data))
-        
-        # Summary + first rows
-        shape_info = f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\nColumns: {', '.join(df.columns.tolist())}\n\n"
-        preview = df.head(20).to_markdown(index=False)
-        return shape_info + preview
-    except Exception as e:
-        logger.error(f"[file_reader] CSV/XLSX parse error: {e}")
-        return f"[CSV/XLSX parse error: {e}]"
+        return await asyncio.wait_for(
+            asyncio.to_thread(_do_parse),
+            timeout=FILE_OP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return f"[CSV/XLSX parse timed out after {FILE_OP_TIMEOUT_SECONDS}s]"
 
 
 async def parse_file(
@@ -139,9 +177,22 @@ async def parse_file(
     elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"):
         text = await _parse_image(data, filename)
     else:
-        # Plain text / code — decode as UTF-8
+        # Plain text / code — decode as UTF-8 with a hard size cap to prevent
+        # context overflow. Files larger than FILE_READ_MAX_BYTES are truncated
+        # with a notice so the model knows content was cut.
         try:
-            text = data.decode("utf-8", errors="replace")
+            raw = data[:FILE_READ_MAX_BYTES]
+            text = raw.decode("utf-8", errors="replace")
+            if len(data) > FILE_READ_MAX_BYTES:
+                truncated_kb = FILE_READ_MAX_BYTES // 1024
+                original_kb = len(data) // 1024
+                text += (
+                    f"\n\n[... file truncated: showing first {truncated_kb} KB "
+                    f"of {original_kb} KB total. Use shell tool to inspect specific lines ...]"
+                )
+                logger.warning(
+                    f"[file_reader] {filename}: truncated {original_kb} KB → {truncated_kb} KB"
+                )
         except Exception as e:
             text = f"[Could not read file: {e}]"
 

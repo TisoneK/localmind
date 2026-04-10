@@ -29,6 +29,7 @@ from core.agent.constants import (
     CLARIFICATION_THRESHOLD,
     OBS_LOG_MAX_CHARS,
     AGENT_INTENTS,
+    AGENT_THINKING_MIN_CHARS,
 )
 from core.agent.models import AgentStep, AgentTrace
 from core.agent.prompts import build_agent_system_prompt
@@ -159,7 +160,7 @@ class AgentLoop:
 
             # Stream sanitized reasoning text to UI
             thinking_display = sanitize_thought_for_display(thought)
-            if thinking_display:
+            if thinking_display and len(thinking_display) >= AGENT_THINKING_MIN_CHARS:
                 yield StreamChunk(text=f"*{thinking_display}*\n\n", done=False)
 
             logger.debug(f"[agent.loop] iter={iteration + 1} thought={thought[:120]}…")

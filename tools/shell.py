@@ -21,6 +21,7 @@ from pathlib import Path
 
 from core.models import Intent, ToolResult, RiskLevel
 from tools import register_tool
+from core.agent.constants import SHELL_OP_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,10 @@ async def shell_exec(message: str) -> ToolResult:
             source="shell",
         )
 
-    timeout = getattr(settings, "localmind_code_exec_timeout", 30)
+    timeout = min(
+        getattr(settings, "localmind_shell_timeout", SHELL_OP_TIMEOUT_SECONDS),
+        SHELL_OP_TIMEOUT_SECONDS,
+    )
     risk = _classify_risk(command)
 
     # Determine working directory - allow user directories and project root

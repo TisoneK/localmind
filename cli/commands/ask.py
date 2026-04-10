@@ -59,11 +59,14 @@ async def _run(message: str, file: Optional[Path], session: Optional[str], model
         content_type = _guess_mime(file)
         console.print(f"[dim]Attached: {filename} ({len(file_bytes):,} bytes)[/dim]")
 
-    # Stream response
+    # Stream response live — print chunks as they arrive instead of buffering
+    # behind a "Thinking..." spinner. The spinner approach collected all chunks
+    # silently and only rendered after done=True, causing a long blank wait on
+    # slow local models.
     console.print()
+    console.print("[bold]LocalMind[/bold]")
     full_response = []
-    with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-        chunks = []
+    try:
         async for chunk in engine.process(
             message=message,
             session_id=session_id,
@@ -74,16 +77,40 @@ async def _run(message: str, file: Optional[Path], session: Optional[str], model
             if chunk.error:
                 console.print(f"\n[red]Error:[/red] {chunk.error}")
                 raise typer.Exit(1)
-            chunks.append(chunk.text)
+            if chunk.text:
+                # Print each token/chunk immediately so the user sees output
+                # as the model generates it rather than waiting for completion.
+                print(chunk.text, end="", flush=True)
+                full_response.append(chunk.text)
             if chunk.done:
                 break
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"\n[red]Unexpected error:[/red] {e}")
+        raise typer.Exit(1)
 
-    response_text = "".join(chunks)
+    print()  # newline after streamed output
+    response_text = "".join(full_response)
 
-    if raw:
-        print(response_text)
-    else:
-        console.print(Markdown(response_text))
+    # Re-render as markdown only if --raw is not set and output went to a terminal
+    # (piped output keeps the raw streamed text already printed above)
+    if not raw and sys.stdout.isatty():
+        # Clear the raw-streamed text and reprint as rendered markdown
+        # Only do this if the response contains markdown signals
+        has_markdown = any(
+            marker in response_text
+            for marker in ("```", "**", "##", "- ", "| ")
+        )
+        if has_markdown:
+            # Move cursor up to overwrite the streamed plain text with rendered version
+            # This is best-effort — terminal support varies. Fall back to just printing.
+            try:
+                lines_printed = response_text.count("\n") + 1
+                console.print(f"\033[{lines_printed}A\033[J", end="")
+                console.print(Markdown(response_text))
+            except Exception:
+                pass  # streamed text already visible — no harm done
 
     console.print(f"\n[dim]Session: {session_id}[/dim]")
 

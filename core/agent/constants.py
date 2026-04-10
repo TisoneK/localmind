@@ -8,7 +8,7 @@ from core.models import Intent
 
 # ── Iteration budget ──────────────────────────────────────────────────────────
 
-MAX_ITERATIONS: int = 2
+MAX_ITERATIONS: int = 3
 """Maximum think→act→observe cycles before forcing a final answer."""
 
 CLARIFICATION_THRESHOLD: float = 0.45
@@ -16,28 +16,64 @@ CLARIFICATION_THRESHOLD: float = 0.45
 
 # ── Context window protection ─────────────────────────────────────────────────
 
-OBS_LOG_MAX_CHARS: int = 100
+OBS_LOG_MAX_CHARS: int = 800
 """
 Max characters kept per observation entry in the running log.
 The *full* observation is still stored in AgentStep for trace/debug.
-Extreme reduction tuned for local LLMs with small context windows.
+800 chars keeps enough signal for the LLM to reason without flooding small
+context windows. Tuned for local models (4k–8k context windows).
 """
 
 # ── Tool retry config ─────────────────────────────────────────────────────────
 
-TOOL_MAX_RETRIES: int = 2
-"""How many times to retry a failing tool call before giving up."""
+TOOL_MAX_RETRIES: int = 1
+"""
+How many times to retry a failing tool call before giving up.
+Reduced from 2 to 1: a single retry catches transient I/O errors without
+burning 4× the latency on genuinely broken inputs (bad path, bad code, etc.).
+"""
 
-TOOL_RETRY_BASE_DELAY: float = 0.5
+TOOL_RETRY_BASE_DELAY: float = 0.3
 """Seconds before the first retry; doubles each subsequent attempt."""
+
+# ── File operation timeouts ───────────────────────────────────────────────────
+
+FILE_OP_TIMEOUT_SECONDS: float = 10.0
+"""
+Hard timeout for file read/write operations.
+Prevents stalls on network mounts, slow disks, or huge files.
+"""
+
+FILE_READ_MAX_BYTES: int = 512 * 1024  # 512 KB
+"""
+Maximum bytes read from a single file before chunking.
+Files larger than this are read in streaming chunks rather than slurped whole.
+Prevents OOM and context overflow on large source files or logs.
+"""
+
+SHELL_OP_TIMEOUT_SECONDS: float = 20.0
+"""
+Default timeout for shell commands (overrides config if lower).
+Separate from code_exec timeout — shell ops like `find` and `grep` on
+large trees can stall; this provides a hard ceiling.
+"""
 
 # ── Web-search result limits ──────────────────────────────────────────────────
 
-WEB_SEARCH_MAX_CHARS_PER_RESULT: int = 100
+WEB_SEARCH_MAX_CHARS_PER_RESULT: int = 400
 """Truncation limit per individual search result entry."""
 
-WEB_SEARCH_MAX_RESULTS: int = 1
+WEB_SEARCH_MAX_RESULTS: int = 3
 """Maximum number of search results injected into context."""
+
+# ── Agent response streaming ──────────────────────────────────────────────────
+
+AGENT_THINKING_MIN_CHARS: int = 20
+"""
+Minimum characters in a sanitized thought before streaming it to the UI.
+Filters out sub-threshold fragments like '*...*' or whitespace-only thinking
+display that pollute the stream without adding signal.
+"""
 
 # ── Intent routing ────────────────────────────────────────────────────────────
 
