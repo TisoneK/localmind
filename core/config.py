@@ -81,8 +81,9 @@ class Settings(BaseSettings):
     localmind_chunk_overlap_tokens: int = 200
 
     # Web search
-    localmind_search_provider: str = "duckduckgo"
+    localmind_search_provider: str = "tiered"  # tiered, duckduckgo, searxng, brave
     brave_search_api_key: str = ""
+    searxng_url: str = "https://searx.be"
 
     # Code executor
     localmind_code_exec_timeout: int = 30

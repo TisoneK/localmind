@@ -1,10 +1,15 @@
 """
-Web Search tool — DuckDuckGo (no API key required) with Brave fallback.
+Web Search tool - Three-tier architecture: DuckDuckGo (fast) -> SearXNG (stable) -> Brave (premium).
 
 Registered as Intent.WEB_SEARCH in the tool registry.
 
 Results are formatted as a compact markdown list so the model can
 reason over them without a huge token footprint.
+
+Architecture:
+- Tier 1: DuckDuckGo - Fast first attempt, no auth required
+- Tier 2: SearXNG - Stable core fallback, multi-source aggregation  
+- Tier 3: Brave - Premium optional layer, requires API key
 """
 from __future__ import annotations
 import logging
@@ -17,7 +22,7 @@ MAX_RESULTS = 5
 SNIPPET_MAX = 300
 
 
-async def _search_ddg(query: str) -> list[dict]:
+async def _search_ddg(query: str) -> tuple[list[dict], str, str]:
     import asyncio
     try:
         from ddgs import DDGS
@@ -33,17 +38,60 @@ async def _search_ddg(query: str) -> list[dict]:
             asyncio.get_event_loop().run_in_executor(None, _run_sync),
             timeout=12,
         )
-        return results
+        return results, "", ""
     except asyncio.TimeoutError:
         logger.warning("[web_search] DDG timed out after 12s")
-        return []
+        return [], "timeout", "DuckDuckGo search timed out after 12 seconds"
     except Exception as e:
         error_msg = str(e).encode('utf-8', errors='ignore').decode('utf-8')
         logger.warning(f"[web_search] DDG failed: {error_msg}")
-        return []
+        return [], "network", f"DuckDuckGo search failed: {error_msg}"
 
 
-async def _search_brave(query: str, api_key: str) -> list[dict]:
+async def _search_searxng(query: str, searxng_url: str = "https://searx.be") -> tuple[list[dict], str, str]:
+    """Search using SearXNG instance with proper error handling."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            # SearXNG API format
+            params = {
+                "q": query,
+                "format": "json",
+                "engines": "google,duckduckgo,bing,startpage",
+                "language": "en",
+                "safesearch": "moderate",
+                "results": MAX_RESULTS
+            }
+            r = await client.get(f"{searxng_url}/search", params=params)
+            r.raise_for_status()
+            data = r.json()
+            
+            # Extract results from SearXNG response
+            results = []
+            for item in data.get("results", [])[:MAX_RESULTS]:
+                results.append({
+                    "title": item.get("title", ""),
+                    "href": item.get("url", ""),
+                    "body": item.get("content", "")
+                })
+            
+            return results, "", ""
+            
+    except asyncio.TimeoutError:
+        logger.warning(f"[web_search] SearXNG timed out after 15s")
+        return [], "timeout", f"SearXNG search timed out after 15 seconds"
+    except Exception as e:
+        logger.warning(f"[web_search] SearXNG failed: {repr(e)}")
+        error_str = str(e)
+        if "404" in error_str or "connection" in error_str.lower():
+            return [], "network", f"SearXNG instance unavailable at {searxng_url}"
+        elif "timeout" in error_str.lower():
+            return [], "timeout", "SearXNG search timed out"
+        else:
+            return [], "network", f"SearXNG search error: {error_str}"
+
+
+async def _search_brave(query: str, api_key: str) -> tuple[list[dict], str, str]:
     try:
         import httpx
         # Pass query directly as string - httpx handles UTF-8 encoding automatically
@@ -51,17 +99,24 @@ async def _search_brave(query: str, api_key: str) -> list[dict]:
             r = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
                 params={"q": query, "count": MAX_RESULTS},
-                headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+                headers={"Accept": "application/json", "x-subscription-token": api_key},
             )
             r.raise_for_status()
             data = r.json()
-            return [
+            results = [
                 {"title": w.get("title", ""), "href": w.get("url", ""), "body": w.get("description", "")}
                 for w in data.get("web", {}).get("results", [])
             ]
+            return results, "", ""
     except Exception as e:
-        logger.warning(f"[web_search] Brave failed: {e}")
-        return []
+        logger.warning(f"[web_search] Brave failed: {repr(e)}")
+        error_str = str(e)
+        if "422" in error_str:
+            return [], "api_key", "Brave Search API key invalid or request format error (HTTP 422)"
+        elif "timeout" in error_str.lower():
+            return [], "timeout", "Brave Search API timed out"
+        else:
+            return [], "network", f"Brave Search API error: {error_str}"
 
 
 def _format_results(results: list[dict]) -> str:
@@ -86,23 +141,73 @@ async def web_search(query: str) -> ToolResult:
     from core.config import settings
 
     results = []
+    error_type = ""
+    error_message = ""
+    successful_provider = ""
 
-    # Try Brave first if API key is set
-    if getattr(settings, "brave_search_api_key", ""):
-        results = await _search_brave(query, settings.brave_search_api_key)
+    # Three-tier search: DDG (fast) -> SearXNG (stable) -> Brave (premium)
+    
+    # Tier 1: DuckDuckGo - fast first attempt
+    logger.info("[web_search] Tier 1: Trying DuckDuckGo")
+    results, error_type, error_message = await _search_ddg(query)
+    if results:
+        successful_provider = "duckduckgo"
+        logger.info(f"[web_search] DuckDuckGo succeeded with {len(results)} results")
 
-    # Fall back to DuckDuckGo
+    # Tier 2: SearXNG - stable core fallback
     if not results:
-        results = await _search_ddg(query)
+        logger.info("[web_search] Tier 2: Trying SearXNG")
+        searxng_url = getattr(settings, "searxng_url", "https://searx.be")
+        results, error_type, error_message = await _search_searxng(query, searxng_url)
+        if results:
+            successful_provider = "searxng"
+            logger.info(f"[web_search] SearXNG succeeded with {len(results)} results")
+
+    # Tier 3: Brave - premium optional layer
+    if not results and getattr(settings, "brave_search_api_key", ""):
+        logger.info("[web_search] Tier 3: Trying Brave")
+        results, error_type, error_message = await _search_brave(query, settings.brave_search_api_key)
+        if results:
+            successful_provider = "brave"
+            logger.info(f"[web_search] Brave succeeded with {len(results)} results")
+
+    # Check if we have results
+    if not results:
+        logger.warning(f"[web_search] All tiers failed. Final error: {error_message}")
+        return ToolResult(
+            content=f"All search providers failed. Last error: {error_message}" if error_message else "No results found from any provider.",
+            risk=RiskLevel.LOW,
+            source="web_search",
+            success=False,
+            error_type=error_type or "all_tiers_failed",
+            error_message=error_message or "All search providers failed",
+            metadata={
+                "query": query, 
+                "result_count": 0, 
+                "sources": [],
+                "successful_provider": "",
+                "attempted_providers": ["duckduckgo", "searxng", "brave" if getattr(settings, "brave_search_api_key", "") else "duckduckgo,searxng"]
+            },
+        )
 
     content = _format_results(results)
     source_urls = [r.get("href", r.get("url", "")) for r in results if r.get("href") or r.get("url")]
 
+    logger.info(f"[web_search] Success via {successful_provider}: {len(results)} results")
     return ToolResult(
         content=content,
         risk=RiskLevel.LOW,
         source="web_search",
-        metadata={"query": query, "result_count": len(results), "sources": source_urls[:5]},
+        success=True,
+        error_type="",
+        error_message="",
+        metadata={
+            "query": query, 
+            "result_count": len(results), 
+            "sources": source_urls[:5],
+            "successful_provider": successful_provider,
+            "attempted_providers": ["duckduckgo", "searxng", "brave" if getattr(settings, "brave_search_api_key", "") else "duckduckgo,searxng"]
+        },
     )
 
 

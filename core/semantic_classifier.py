@@ -414,28 +414,62 @@ class SemanticClassifier:
         self._embedding_model = None
         self._embeddings_cache = {}
         self._initialized = False
-    
+        # Permanently False once we confirm the model is not locally cached.
+        # Prevents per-request retry storms: if the model isn't on disk, it
+        # will never appear on disk mid-request, so retrying is pointless.
+        self._init_failed_permanently = False
+
     def _initialize_model(self):
-        """Lazy initialization of embedding model."""
-        if self._initialized:
+        """
+        Lazy initialization of the local sentence-transformer model.
+
+        NETWORK POLICY — this method MUST NOT make any network requests:
+          - SentenceTransformer is loaded with local_files_only=True so it
+            raises an exception immediately instead of attempting a HuggingFace
+            download.  Downloads are an operator concern (run once at setup);
+            they must never happen in the request path.
+          - If the model is not cached locally, _init_failed_permanently is set
+            True so every subsequent call returns instantly rather than retrying.
+
+        Callers should check _init_failed_permanently before calling to avoid
+        even the overhead of this method's guard clause.
+        """
+        if self._initialized or self._init_failed_permanently:
             return
-        
+
         try:
-            # Try to import sentence-transformers
             from sentence_transformers import SentenceTransformer
-            self._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            # local_files_only=True → raises OSError/EnvironmentError immediately
+            # if the model is not in the HuggingFace cache.  No network, no HEAD
+            # request, no retry storm.
+            self._embedding_model = SentenceTransformer(
+                'all-MiniLM-L6-v2',
+                local_files_only=True,
+            )
             self._initialized = True
-            logger.info("[semantic] Initialized sentence transformer model")
-            
+            logger.info("[semantic] Initialized sentence transformer model (local cache)")
+
             # Pre-compute embeddings for semantic examples
             self._precompute_embeddings()
-            
+
         except ImportError:
-            logger.warning("[semantic] sentence-transformers not available, using fallback")
-            self._initialized = False
+            logger.warning(
+                "[semantic] sentence-transformers not installed — "
+                "semantic classification disabled (rule-based fallback active)"
+            )
+            self._init_failed_permanently = True
+        except (OSError, EnvironmentError):
+            # Model not in local cache.  This is expected on first run before
+            # the operator has run: python -m localmind.setup --download-models
+            logger.warning(
+                "[semantic] all-MiniLM-L6-v2 not found in local cache — "
+                "semantic classification disabled. "
+                "Run `python scripts/setup_semantic.py` to download."
+            )
+            self._init_failed_permanently = True
         except Exception as e:
-            logger.error(f"[semantic] Failed to initialize model: {e}")
-            self._initialized = False
+            logger.error("[semantic] Failed to initialize model: %s", e)
+            self._init_failed_permanently = True
     
     def _precompute_embeddings(self):
         """Pre-compute embeddings for semantic examples."""
@@ -480,18 +514,29 @@ class SemanticClassifier:
     def classify(self, message: str, has_attachment: bool = False) -> Tuple[Intent, Optional[Intent], float]:
         """
         Classify message intent using semantic similarity + rule-based fallback.
-        
+
         Returns:
             (primary_intent, secondary_intent, confidence)
         """
+        # Fast-exit: permanent init failure means semantic layer is unavailable.
+        # Fall through to rule-based immediately — zero overhead.
+        if self._init_failed_permanently:
+            primary, secondary = intent_router.classify_multi(message, has_attachment)
+            return primary, secondary, 0.70
+
         self._initialize_model()
-        
+
+        # If init just failed for the first time, fall through to rule-based.
+        if not self._initialized:
+            primary, secondary = intent_router.classify_multi(message, has_attachment)
+            return primary, secondary, 0.70
+
         # Fast-path: obvious conversational messages
         import re
         stripped = message.strip()
         if any(re.fullmatch(p, stripped, re.IGNORECASE) for p in _OBVIOUS_CHAT_PATTERNS):
             return Intent.CHAT, None, 0.95
-        
+
         # Fast-path: very short messages with no tool signals.
         # Use rule-based classification instead of 7 separate model inferences —
         # the rule-based router is instant and reliable for short queries.

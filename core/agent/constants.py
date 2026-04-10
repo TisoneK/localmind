@@ -78,13 +78,13 @@ display that pollute the stream without adding signal.
 # ── Intent routing ────────────────────────────────────────────────────────────
 
 AGENT_INTENTS: frozenset[Intent] = frozenset({
-    Intent.WEB_SEARCH,
     Intent.CODE_EXEC,
     Intent.FILE_WRITE,
     Intent.MEMORY_OP,
-    # Intent.SHELL     — handled directly by engine (prevents hallucination)
-    # Intent.FILE_TASK — handled directly by engine (prevents hallucination)
-    # Intent.SYSINFO   — instant offline tool, no loop needed
+    # Intent.WEB_SEARCH  — direct dispatch in engine.py (no LLM loop needed)
+    # Intent.SHELL       — handled directly by engine (prevents hallucination)
+    # Intent.FILE_TASK   — handled directly by engine (prevents hallucination)
+    # Intent.SYSINFO     — instant offline tool, no loop needed
 })
 """Intents that are routed through the agent loop rather than direct dispatch."""
 

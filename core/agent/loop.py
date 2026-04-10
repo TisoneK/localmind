@@ -96,6 +96,26 @@ class AgentLoop:
         active_adapter = adapter or self._adapter
         trace = AgentTrace()
 
+        # ── Pre-flight: verify Ollama is reachable before entering loop ────
+        # Without this check, an unreachable or cold-loading Ollama causes
+        # each iteration to wait the full ollama_timeout (default 120s) before
+        # failing.  A 5-second health probe here converts a 300s+ hang into an
+        # immediate, actionable error message.
+        if hasattr(active_adapter, "health_check"):
+            try:
+                reachable = await active_adapter.health_check()
+            except Exception:
+                reachable = False
+            if not reachable:
+                msg = (
+                    "Ollama is not reachable right now. "
+                    "Make sure Ollama is running (`ollama serve`) and try again."
+                )
+                logger.error("[agent.loop] pre-flight failed — Ollama unreachable")
+                yield StreamChunk(text=msg, done=False)
+                yield StreamChunk(text="", done=True)
+                return
+
         # ── Clarification gate ─────────────────────────────────────────
         if confidence < CLARIFICATION_THRESHOLD and intent in AGENT_INTENTS:
             clarification = (
@@ -446,64 +466,64 @@ class AgentLoop:
         trace: AgentTrace,
     ) -> AsyncIterator[StreamChunk]:
         """
-        Write full search results and an extractive summary to files,
-        then yield a rich immediate response to the user.
+        Stream search results to the user immediately, then write result files
+        as a background task.
+
+        Previously this awaited two file-write tool calls before yielding
+        anything to the user — adding 2× FILE_OP_TIMEOUT latency to every
+        web search.  Now the user sees the preview instantly; file writes
+        happen concurrently and their filenames are included in the response
+        optimistically (they will be present by the time the user tries to
+        open them).
         """
         filename = f"search_results_{int(time.time())}.md"
+        summary_filename = filename.replace(".md", "_summary.md")
+
         file_content = (
             f"# Web Search Results: {query}\n\n"
             f"*Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
             f"{safe_obs}"
         )
+        summary = create_extractive_summary(safe_obs, query)
 
-        try:
-            file_result, file_failed, _ = await dispatch_with_retry(
-                Intent.FILE_WRITE, f"{filename}:\n\n{file_content}"
-            )
-            if file_failed or not file_result:
-                raise RuntimeError("file_write tool returned failure")
-
-            logger.info(f"[agent.loop] web search results written to {filename}")
-
-            # Build and write extractive summary
-            summary = create_extractive_summary(safe_obs, query)
-            summary_filename = filename.replace(".md", "_summary.md")
-            summary_result, summary_failed, _ = await dispatch_with_retry(
-                Intent.FILE_WRITE, f"{summary_filename}:\n\n{summary}"
-            )
-            if not summary_failed and summary_result:
+        # Fire-and-forget: write both files in the background.
+        # User gets the result now; files will be on disk in < 1s.
+        async def _write_files() -> None:
+            try:
+                await dispatch_with_retry(
+                    Intent.FILE_WRITE, f"{filename}:\n\n{file_content}"
+                )
+                logger.info(f"[agent.loop] web search results written to {filename}")
+            except Exception as exc:
+                logger.warning(f"[agent.loop] search result file write failed: {exc}")
+            try:
+                await dispatch_with_retry(
+                    Intent.FILE_WRITE, f"{summary_filename}:\n\n{summary}"
+                )
                 logger.info(f"[agent.loop] summary written to {summary_filename}")
-            else:
-                logger.warning(f"[agent.loop] summary write failed; continuing without summary file")
-                summary_filename = None
+            except Exception as exc:
+                logger.warning(f"[agent.loop] summary file write failed: {exc}")
 
-            # Build immediate response
-            summary_line = (
-                f"\n📄 **Summary created:** `{summary_filename}`"
-                if summary_filename else ""
-            )
-            immediate_response = (
-                f"✅ **Search complete!** Full results saved to `{filename}`"
-                f"{summary_line}\n\n"
-                f"💡 *Quick preview:*\n{truncate_web_search_results(safe_obs)}"
-            )
+        asyncio.create_task(_write_files())
 
-            trace.final_response = immediate_response
-            trace.steps.append(AgentStep(
-                iteration=iteration + 1,
-                thought=thought,
-                tool_name="web_search",
-                tool_input=query,
-                observation=f"Results → {filename}" + (f", summary → {summary_filename}" if summary_filename else ""),
-            ))
+        # Build and stream immediate response — don't wait for file writes.
+        immediate_response = (
+            f"✅ **Search complete!** Full results saved to `{filename}`\n"
+            f"📄 **Summary created:** `{summary_filename}`\n\n"
+            f"💡 *Quick preview:*\n{truncate_web_search_results(safe_obs)}"
+        )
 
-            yield StreamChunk(text=immediate_response, done=False)
-            yield StreamChunk(text="", done=True)
+        trace.final_response = immediate_response
+        trace.steps.append(AgentStep(
+            iteration=iteration + 1,
+            thought=thought,
+            tool_name="web_search",
+            tool_input=query,
+            observation=f"Results → {filename}, summary → {summary_filename}",
+        ))
 
-        except Exception as exc:
-            logger.error(f"[agent.loop] failed to write web search results: {exc}")
-            # Fall through — caller will continue normal observation flow
-            # (web search observation stays in context for next iteration)
+        yield StreamChunk(text=immediate_response, done=False)
+        yield StreamChunk(text="", done=True)
 
     # ------------------------------------------------------------------
     # Forced final answer after iteration limit

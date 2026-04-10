@@ -83,6 +83,8 @@ def create_app() -> FastAPI:
                 if vector_store._ready:
                     count = await vector_store.count()
                     logger.info(f"[startup] VectorStore ready — {count} facts stored")
+                    # Warm up Ollama embedding model
+                    await vector_store.warmup()
                 else:
                     logger.info("[startup] VectorStore not ready")
             except Exception as e:

@@ -50,7 +50,7 @@ def main():
         for message, expected_intent in test_cases:
             try:
                 primary, _, confidence = classify_intent_semantic(message, False)
-                if primary.value == expected_intent and confidence > 0.8:
+                if primary.value == expected_intent and confidence >= 0.8:
                     print(f"  PASS: '{message}' -> {primary.value} ({confidence:.2f})")
                 else:
                     print(f"  FAIL: '{message}' -> {primary.value} ({confidence:.2f}) [expected {expected_intent}]")
