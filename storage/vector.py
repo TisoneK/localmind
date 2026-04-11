@@ -64,8 +64,11 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_EMBED_MODEL   = "nomic-embed-text"
 _EMBED_TIMEOUT = 30
+
+def _get_embed_model() -> str:
+    """Read embed model from settings at call time (supports hot-swap in tests)."""
+    return settings.ollama_embed_model
 
 # ── Bounded thread pool ────────────────────────────────────────────────────────
 # Shared across all VectorStore instances.  Sized to CPU count — beyond that,
@@ -182,9 +185,10 @@ def _embed_cached(norm_text: str, base_url: str) -> tuple:
     """
     t0  = time.monotonic()
     url = f"{base_url.rstrip('/')}/api/embeddings"
+    embed_model = _get_embed_model()
     result = None
     try:
-        resp = httpx.post(url, json={"model": _EMBED_MODEL, "prompt": norm_text},
+        resp = httpx.post(url, json={"model": embed_model, "prompt": norm_text},
                           timeout=_EMBED_TIMEOUT)
         if resp.status_code != 200:
             resp = httpx.post(url, json={"model": settings.ollama_model, "prompt": norm_text},
@@ -286,9 +290,31 @@ class VectorStore:
         self._write_buf_lock   = threading.Lock()
         self._write_buf_last_flush: float = time.monotonic()
 
+        self._dim_mismatch: tuple[int, int] | None = None  # (stored_dim, actual_dim)
         self._init_db()
 
     # ── Setup ──────────────────────────────────────────────────────────────
+
+    def _probe_embed_dim(self) -> int | None:
+        """
+        Ask Ollama for the actual embedding dimension with a minimal probe string.
+        Runs synchronously (blocking) — only called once at startup inside _init_db.
+        Returns None if Ollama is unreachable (treated as "no mismatch, carry on").
+        """
+        try:
+            url = f"{self._base_url.rstrip('/')}/api/embeddings"
+            resp = httpx.post(
+                url,
+                json={"model": settings.ollama_embed_model, "prompt": "dim_probe"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                vec = resp.json().get("embedding")
+                if vec:
+                    return len(vec)
+        except Exception:
+            pass
+        return None
 
     def _connect(self) -> sqlite3.Connection:
         return _get_connection(self._db_path)
@@ -325,10 +351,28 @@ class VectorStore:
                 "SELECT value FROM vector_meta WHERE key = 'dim'"
             ).fetchone()
             if row:
-                self._dim = int(row["value"])
-                self._ensure_vec_table(conn)
+                stored_dim = int(row["value"])
+                # Probe actual embed dim synchronously (one cheap blocking call at startup)
+                actual_dim = self._probe_embed_dim()
+                if actual_dim is not None and actual_dim != stored_dim:
+                    logger.error(
+                        "[vector] DIM MISMATCH — DB has dim=%d but %s now returns dim=%d. "
+                        "Run: python scripts/reset_vector_db.py --yes",
+                        stored_dim, settings.ollama_embed_model, actual_dim,
+                    )
+                    self._dim_mismatch = (stored_dim, actual_dim)
+                    # Leave self._ready = False so callers get empty results,
+                    # not a cryptic sqlite-vec error
+                else:
+                    self._dim = stored_dim
+                    self._ensure_vec_table(conn)
+                    self._ready = True
+            else:
+                # Fresh DB — no dim row yet.  Mark ready so the first store() call
+                # can flow through _persist → _set_dim which records the dim and
+                # creates vector_embeddings at the correct dimension.
                 self._ready = True
-            logger.debug("VectorStore ready at %s", self._db_path)
+            logger.debug("VectorStore ready at %s (dim=%s)", self._db_path, self._dim)
         except Exception as exc:
             logger.error("VectorStore init failed: %s", exc)
 

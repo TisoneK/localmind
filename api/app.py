@@ -89,23 +89,55 @@ def create_app() -> FastAPI:
                     logger.info("[startup] VectorStore not ready")
             except Exception as e:
                 logger.warning(f"[startup] VectorStore warm-up failed: {e}")
-        
-        # Start VectorStore warm-up in background
-        import asyncio
-        background_tasks = set()
-        task = asyncio.create_task(warm_vector_store())
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-        
-        # Warm up model router with currently pulled models
-        try:
+
+        async def warm_llm_models():
+            """
+            Pre-load every configured LLM into Ollama VRAM before the first request.
+
+            Ollama lazy-loads models on first use — that initial load costs 30–90 s of
+            dead wait on the first user message.  Sending an empty /api/generate prompt
+            forces the load at server startup instead, so every subsequent request starts
+            generating within 1–2 s.
+
+            Models are warmed concurrently (asyncio.gather) so total startup cost is
+            bounded by the slowest model, not the sum of all models.
+            """
             from adapters.ollama import OllamaAdapter
             from core.model_router import update_pulled_models
-            adapter = OllamaAdapter()
-            pulled = await adapter.list_models()
-            update_pulled_models(pulled)
-            logger.info(f"[startup] model router ready — {len(pulled)} models available")
-        except Exception as e:
-            logger.warning(f"[startup] model router warm-up failed: {e}")
+
+            # Collect every distinct model name from config
+            model_names: list[str] = [settings.ollama_model]
+            for extra in (settings.ollama_model_fast, settings.ollama_model_code):
+                if extra and extra not in model_names:
+                    model_names.append(extra)
+
+            # Refresh router first (cheap /api/tags call)
+            try:
+                base_adapter = OllamaAdapter()
+                pulled = await base_adapter.list_models()
+                update_pulled_models(pulled)
+                logger.info(f"[startup] model router ready — {len(pulled)} models available")
+            except Exception as e:
+                logger.warning(f"[startup] model router refresh failed: {e}")
+                pulled = []
+
+            # Warm every model that is actually pulled locally
+            async def _warm_one(model_name: str):
+                if pulled and model_name not in pulled:
+                    logger.info(f"[startup] skipping warmup for '{model_name}' — not pulled locally")
+                    return
+                adapter = OllamaAdapter(model_override=model_name)
+                await adapter.warmup()
+
+            import asyncio
+            await asyncio.gather(*[_warm_one(m) for m in model_names], return_exceptions=True)
+
+        import asyncio
+        background_tasks = set()
+
+        for coro in (warm_vector_store(), warm_llm_models()):
+            task = asyncio.create_task(coro)
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
     return app

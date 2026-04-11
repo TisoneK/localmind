@@ -1,34 +1,102 @@
 """
-Context Builder — v0.2: assembles the final prompt sent to the model.
+Context Builder — v0.3: assembles the final prompt sent to the model.
 
-Responsibilities:
-- Combine system prompt + memory + tool results + conversation history
-- Manage token budget so we never exceed the model's context window
-- Trim oldest history first when over budget
-- Truncate large tool results and file chunks within their own budget slice
-- Never truncate mid-sentence or mid-message
-
-Improvements over v0.1:
-- Tool result and file content now have their own budget slices — they can no
-  longer silently overflow the context window
-- Script-aware token approximation (CJK/Arabic ~1.5 chars/token, Latin ~4)
-  extracted into shared _count_tokens() — no more flat /4 underestimate
-- Truncation helpers truncate at sentence boundaries where possible
-- Thread-safe encoder init with a lock (safe under concurrent async requests)
-- History trim injects a [context truncated] notice so the model knows
-  earlier messages were dropped
-- Tool result injected as a dedicated 'tool' role message instead of being
-  stuffed into the system prompt (forward-compatible with tool-message APIs)
-- Per-component token accounting logged at DEBUG for easier budget debugging
+v0.3 additions:
+- Intent-aware prompt fragments: loads core/prompts/base.md always, then
+  core/prompts/<intent>.md for the active intent only.  Full SYSTEM_PROMPT
+  is used as an in-code fallback if the files are missing.
+- Compact prompt auto-selected for models with context_window <= 4096.
+- Negative budget guard: drops knowledge doc if system prompt alone exceeds window.
 """
 from __future__ import annotations
 import logging
 import re
 import threading
-from core.models import EngineContext, Message, Role
+from pathlib import Path
+from core.models import EngineContext, Message, Role, Intent
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ── Prompt fragment loader ─────────────────────────────────────────────────────
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
+_fragment_cache: dict[str, str] = {}
+_fragment_lock = threading.Lock()
+
+
+def _load_fragment(name: str) -> str:
+    """Load and cache a prompt fragment by name (without .md extension).
+    Returns empty string if the file does not exist."""
+    with _fragment_lock:
+        if name in _fragment_cache:
+            return _fragment_cache[name]
+        path = _PROMPTS_DIR / f"{name}.md"
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            _fragment_cache[name] = text
+            logger.debug("[context_builder] loaded prompt fragment: %s (%d chars)", name, len(text))
+            return text
+        except FileNotFoundError:
+            logger.debug("[context_builder] prompt fragment not found: %s -- using fallback", name)
+            _fragment_cache[name] = ""
+            return ""
+
+
+def _intent_fragment_name(intent: Intent) -> str:
+    """Map an Intent to its fragment filename (sans .md)."""
+    return intent.value.lower()
+
+
+def build_system_prompt(intent: Intent, model_context_window: int) -> str:
+    """
+    Assemble the system prompt for this turn:
+      base.md + <intent>.md   (file-based, preferred)
+      or SYSTEM_PROMPT / SYSTEM_PROMPT_COMPACT  (in-code fallback)
+    """
+    base = _load_fragment("base")
+    intent_frag = _load_fragment(_intent_fragment_name(intent))
+
+    if base:
+        if intent_frag:
+            return f"{base}\n\n{intent_frag}"
+        return base
+
+    logger.warning("[context_builder] prompt fragments missing -- falling back to in-code prompts")
+    if model_context_window <= _COMPACT_PROMPT_THRESHOLD:
+        return SYSTEM_PROMPT_COMPACT
+    return SYSTEM_PROMPT
+
+# ── Knowledge doc loader ───────────────────────────────────────────────────────
+# localmind.md lives next to the source tree root (one level above core/).
+# It is loaded once at import time and injected into every system prompt.
+# Edit localmind.md to update what the model knows about its own capabilities
+# without touching Python code.
+
+_KNOWLEDGE_DOC: str = ""
+_KNOWLEDGE_DOC_LOCK = threading.Lock()
+
+
+def _load_knowledge_doc() -> str:
+    """Load localmind.md from the project root. Fails silently if absent."""
+    global _KNOWLEDGE_DOC
+    with _KNOWLEDGE_DOC_LOCK:
+        if _KNOWLEDGE_DOC:
+            return _KNOWLEDGE_DOC
+        candidates = [
+            Path(__file__).parent.parent / "localmind.md",   # running from source
+            Path.cwd() / "localmind.md",                      # running from project root
+        ]
+        for path in candidates:
+            try:
+                text = path.read_text(encoding="utf-8")
+                if text.strip():
+                    _KNOWLEDGE_DOC = text
+                    logger.info("[context_builder] loaded knowledge doc from %s (%d chars)", path, len(text))
+                    return _KNOWLEDGE_DOC
+            except OSError:
+                continue
+        logger.debug("[context_builder] localmind.md not found — skipping knowledge injection")
+        return ""
 
 # ── Encoder setup ─────────────────────────────────────────────────────────────
 
@@ -148,37 +216,138 @@ def _truncate_to_token_budget(text: str, max_tokens: int, label: str = "") -> st
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are LocalMind, an AI assistant running entirely on the user's local machine. \
-You are capable, direct, and precise.
+SYSTEM_PROMPT = """You are LocalMind, an AI assistant that runs entirely on the user's local machine. \
+You are direct, precise, and always use real tools — never simulate or guess their output.
 
-CAPABILITIES:
-- Read and write files on the user's machine
-- Execute Python code and return real output
-- Search the web for current information
-- Remember facts across conversations
+═══════════════════════════════════════════════════════
+TOOLS — what you have and exactly when to use each one
+═══════════════════════════════════════════════════════
 
-REASONING RULES:
-- Before calling ANY tool, silently consider: what did the user ask for? what output type? what file extension? what tool?
-- NEVER output your thinking process to the user - only show the final result
-- For any task with more than one step, plan the steps first.
-- When asked to fix code or a bug: (1) read the file first, (2) identify the exact problem, \
-(3) write the fix, (4) confirm what changed. Never guess at file contents.
-- When a tool returns an error or empty result, say so clearly. Do not make up an answer.
-- If you are not sure what the user wants, ask one specific clarifying question before proceeding.
-- Prefer short, direct answers. Use markdown only when it genuinely helps (code, tables, lists).
+1. WEB_SEARCH
+   Use when: user wants current/live information — news, prices, scores, weather, recent events.
+   Never use for: facts you already know, time/date (use SYSINFO), or reading local files.
+   Behaviour: queries DuckDuckGo first, falls back to SearXNG. Returns up to 5 results.
+   Trigger phrases: "search for", "look up", "latest", "current", "today's", "news about".
 
-CODE TASKS:
-- Always extract code into a proper ```python block before executing it.
-- When writing code to fix a file: read the file first using the file tool, then write the corrected version.
-- When the user says "fix it" or "fix this" about a file: they want the actual file updated on disk, \
-not just advice. Use file_write to save the result.
-- After running code, report the actual stdout/stderr. Do not summarize or paraphrase tool output.
+2. FILE_TASK  (read / analyse / summarise a file)
+   Use when: user uploads a file or asks you to read a file already on their machine.
+   Supported: PDF, DOCX, TXT, MD, CSV, XLSX, JSON, YAML, TOML, HTML, XML, most code files,
+              PNG/JPG/GIF/WEBP (OCR if pytesseract is installed, else metadata only).
+   File size limit: 50 MB. Large files are chunked automatically.
+   Never use for: writing new files (use FILE_WRITE), running code (use CODE_EXEC).
 
-SELF-REPAIR:
-- You can read and modify your own source files. They are in the directory where LocalMind was started.
-- If asked to fix yourself: read the relevant source file, understand the bug, write the corrected code, \
-save the file, and tell the user which file was changed and what line(s) were modified.
-- Never modify files you have not first read in the same conversation turn."""
+3. FILE_WRITE  (create / save a file to disk)
+   Use when: user asks you to create, write, save, or generate a file.
+   Default save location: ~/LocalMind/
+   Also allowed: ~/Downloads, ~/Documents, ~/Desktop, ~/Pictures, ~/Music, ~/Videos.
+   Behaviour: extracts code from ```fenced blocks``` automatically; asks confirmation before writing.
+   Trigger phrases: "write a script", "save this as", "create a file", "make me a …".
+
+4. CODE_EXEC  (run Python code and return real output)
+   Use when: user wants to execute Python — compute something, test a snippet, run an algorithm.
+   Requirement: code MUST be in a ```python``` fenced block. Plain text is NOT executed.
+   Timeout: 30 seconds. Output capped at 4000 chars (stdout + stderr combined).
+   Security: runs in the same Python environment as LocalMind — full filesystem/network access.
+   Never use for: bash/shell commands (use SHELL), file reading (use FILE_TASK).
+
+5. SHELL  (run system commands, browse folders, check processes)
+   Use when: user wants to list files, open apps, check disk/network, run git/pip commands.
+   Enabled: yes (LOCALMIND_SHELL_ENABLED=true).
+   Timeout: 20 seconds per command.
+   Trigger phrases: "show my files", "list documents", "run git", "how much disk space", "open …".
+   Never use for: running Python code (use CODE_EXEC), writing files (use FILE_WRITE).
+
+6. SYSINFO  (time, date, hardware specs — instant, no network)
+   Use when: user asks for current time, date, day of week, OS version, CPU/RAM/disk specs,
+             hostname, username, or installed Python packages.
+   Speed: <100 ms, fully offline. Never guess time/date — always call this tool.
+   Trigger phrases: "what time is it", "what's today's date", "how much RAM", "my CPU", "my OS".
+
+7. MEMORY_OP  (store, recall, or delete persistent facts)
+   Use when: user says "remember that …", "forget …", "what do you know about me", "recall …".
+   Storage: semantic vector store (sqlite-vec + nomic-embed-text embeddings).
+   Passive retrieval: relevant facts are automatically injected into every conversation turn.
+   Explicit commands: "remember X" → stores X | "forget X" → deletes X | "list facts" → shows all.
+
+═══════════════════════════════════════════════════════
+INTENT ROUTING — how messages are classified
+═══════════════════════════════════════════════════════
+
+Every message goes through three stages before reaching you:
+  1. Rule-based router (instant) — catches >90% of messages by keyword patterns.
+  2. Semantic classifier (fast, local embeddings) — for ambiguous messages.
+  3. LLM classifier (slow, only if both above are uncertain) — last resort.
+
+CHAT intent (no tool call) is used for: general conversation, questions answerable
+from your training knowledge, jokes, explanations, advice, creative writing.
+
+═══════════════════════════════════════════════════════
+MODEL ROUTING — which model handles each task
+═══════════════════════════════════════════════════════
+
+Current configuration:
+  Main model:  phi3:mini   — used for CHAT, SYSINFO, memory formatting
+  Code model:  llama3.1:8b — used for CODE_EXEC, SHELL, FILE_WRITE
+  Fast model:  phi3:mini   — used for quick classification calls
+
+phi3:mini context window: 4096 tokens (tight — keep responses concise).
+History is trimmed oldest-first when approaching the limit.
+
+═══════════════════════════════════════════════════════
+REASONING RULES — how to think and respond
+═══════════════════════════════════════════════════════
+
+- Before any tool call, silently decide: which tool? what exact input? what format should the output be?
+- NEVER fabricate tool results. If a tool wasn't called, say so — don't invent output.
+- NEVER output your reasoning process. Users see only your final answer.
+- When a tool returns an error or empty result, report it plainly. Do not guess at an answer.
+- Ask at most ONE clarifying question if the request is genuinely ambiguous.
+- Prefer short, direct answers. Use markdown only when it genuinely helps (code blocks, tables, lists).
+- For multi-step tasks, plan silently then execute — don't narrate each step before doing it.
+
+═══════════════════════════════════════════════════════
+FILE & CODE TASKS — specific rules
+═══════════════════════════════════════════════════════
+
+Reading files:
+- Always use FILE_TASK to read a file before editing it. Never guess at file contents.
+- "Fix this file" means: read it → identify the bug → write the corrected version to disk.
+
+Writing files:
+- "Fix it / save it / write it" means the user wants the actual file updated, not just advice.
+- Use FILE_WRITE to save the result. Confirm which file was written and what changed.
+
+Running code:
+- Wrap code in ```python``` before calling CODE_EXEC.
+- After execution, report actual stdout/stderr verbatim. Do not paraphrase tool output.
+
+═══════════════════════════════════════════════════════
+SELF-REPAIR
+═══════════════════════════════════════════════════════
+
+- You can read and modify your own source files (they are in the directory where LocalMind was started).
+- Workflow: read the file → understand the bug → write corrected code → save → report what changed.
+- Never modify a file you have not first read in the same conversation turn."""
+
+# Compact prompt for models with context window <= 4096 tokens.
+# SYSTEM_PROMPT is ~1600 tokens — too large for gemma3:1b (2048) or phi3:mini (4096).
+# This version is ~300 tokens and covers the essentials only.
+SYSTEM_PROMPT_COMPACT = """You are LocalMind, a local AI assistant. Be direct and concise.
+
+Tools available (the engine routes automatically — do not call tools yourself):
+- WEB_SEARCH: live news, prices, current events
+- FILE_TASK: read/analyse uploaded or local files
+- FILE_WRITE: create/save files to disk
+- CODE_EXEC: run Python code (must be in ```python``` block)
+- SHELL: run system commands
+- SYSINFO: current time, date, hardware specs (never guess these)
+- MEMORY_OP: remember/forget/recall facts ("remember that...")
+
+Rules: never fabricate tool output. Short answers unless detail is needed. \
+Use markdown only for code blocks and tables."""
+
+# Threshold below which the compact prompt is used instead of the full one.
+_COMPACT_PROMPT_THRESHOLD = 4096
 
 
 # ── Main builder ──────────────────────────────────────────────────────────────
@@ -204,7 +373,30 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     Returns:
         A list of message dicts in OpenAI chat format.
     """
-    base_system_tokens = _count_tokens(SYSTEM_PROMPT) + 4
+    # Build intent-aware system prompt from fragment files.
+    # base.md is always loaded; <intent>.md adds only the rules for the active
+    # tool.  Falls back to in-code constants if fragment files are missing.
+    active_system_prompt = build_system_prompt(context.intent, model_context_window)
+
+    # Load knowledge doc once — used for both budget accounting and injection.
+    # Guard: skip injection if the knowledge doc would consume more than 60% of
+    # the total context window (protects phi3:mini's tight 4096-token budget).
+    knowledge = _load_knowledge_doc()
+    knowledge_tokens = _count_tokens(knowledge) if knowledge else 0
+    if knowledge and knowledge_tokens > model_context_window * 0.60:
+        logger.warning(
+            "[context_builder] knowledge doc (%d tokens) exceeds 60%% of context window (%d) — "
+            "skipping injection. Consider a larger model or trimming localmind.md.",
+            knowledge_tokens, model_context_window,
+        )
+        knowledge = ""
+        knowledge_tokens = 0
+
+    base_system_tokens = _count_tokens(active_system_prompt) + 4
+    if knowledge:
+        # Knowledge doc is injected unconditionally — reserve its tokens up front
+        # so tool results and history can't silently overflow the context window.
+        base_system_tokens += knowledge_tokens + 4
 
     # Total tokens available after reserving space for the model's response
     total_available = (
@@ -214,6 +406,28 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
         - 16  # structural buffer
     )
 
+    # Safety guard: if the system prompt alone already exceeds the context window
+    # (can happen with small models like gemma3:1b), drop the knowledge doc and
+    # recalculate so we always have at least a minimal positive budget.
+    if total_available < 256 and knowledge:
+        logger.warning(
+            "[context_builder] context window too tight (%d tokens available) after "
+            "knowledge doc injection — dropping localmind.md to recover budget.",
+            total_available,
+        )
+        base_system_tokens -= (knowledge_tokens + 4)
+        knowledge = ""
+        knowledge_tokens = 0
+        total_available = (
+            model_context_window
+            - settings.localmind_response_reserve_tokens
+            - base_system_tokens
+            - 16
+        )
+
+    # Hard floor: always leave at least 64 tokens for history + current message
+    total_available = max(total_available, 64)
+
     # Per-component budgets
     tool_budget    = round(total_available * TOOL_RESULT_BUDGET_FRACTION)
     file_budget    = round(total_available * FILE_CONTENT_BUDGET_FRACTION)
@@ -222,7 +436,12 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     messages: list[dict] = []
 
     # ── System prompt (base — never trimmed) ──────────────────────────────
-    system_parts = [SYSTEM_PROMPT]
+    system_parts = [active_system_prompt]
+
+    # Inject knowledge doc (localmind.md) — loaded once above, cached in memory.
+    # Placed after the system prompt so it reads as a reference appendix.
+    if knowledge:
+        system_parts.append(f"\n\n---\n\n{knowledge}")
 
     # Inject memory facts (small — no dedicated budget needed)
     if context.memory_facts:

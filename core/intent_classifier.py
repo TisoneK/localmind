@@ -73,36 +73,44 @@ async def classify_with_llm(
     adapter,
 ) -> tuple[Intent, Optional[Intent], float]:
     """
-    Classify intent. Semantic first, then rule-based, then LLM fallback.
+    Classify intent. Rule-based first, then semantic, then LLM fallback.
+
+    Order matters for latency:
+      1. Rule-based  — instant, zero I/O. Covers >90% of messages at high conf.
+      2. Semantic    — local embedding model, ~5–20 ms when cached. Only reached
+                       when rules return low confidence.
+      3. LLM call   — one Ollama round-trip (~1–3 s). Only for genuinely ambiguous
+                       messages that neither rules nor embeddings can resolve.
 
     Returns (primary, secondary, confidence).
     """
-    # Step 1: Try semantic classification (future-proof)
-    try:
-        from core.semantic_classifier import classify_intent_semantic
-        semantic_primary, semantic_secondary, semantic_confidence = classify_intent_semantic(message, has_attachment)
-        
-        # If semantic classification is confident, use it
-        if semantic_confidence >= 0.75:  # Higher threshold for semantic
-            logger.debug(
-                f"[classifier] semantic match: {semantic_primary.value} "
-                f"conf={semantic_confidence:.2f} (skipped rule-based + LLM)"
-            )
-            return semantic_primary, semantic_secondary, semantic_confidence
-    except Exception as e:
-        logger.debug(f"[classifier] semantic classification failed: {e}")
-
-    # Step 2: Fast rule-based classification
+    # Step 1: Fast rule-based classification — runs in microseconds, no I/O.
+    # If confidence is high enough, return immediately without any model call.
     rule_primary, rule_secondary = intent_router.classify_multi(message, has_attachment)
     rule_confidence = _RULE_CONFIDENCE_BY_INTENT.get(rule_primary.value, 0.70)
 
     if rule_confidence >= _RULE_CONFIDENCE_THRESHOLD:
-        # High confidence - skip LLM entirely, return immediately
         logger.debug(
             f"[classifier] rule-based shortcut: {rule_primary.value} "
-            f"conf={rule_confidence:.2f} (skipped LLM)"
+            f"conf={rule_confidence:.2f} (skipped semantic + LLM)"
         )
         return rule_primary, rule_secondary, rule_confidence
+
+    # Step 2: Semantic classification — only for low-confidence rule results.
+    # local_files_only=True means it fails instantly if the model isn't cached,
+    # so there's no network penalty when the model is absent.
+    try:
+        from core.semantic_classifier import classify_intent_semantic
+        semantic_primary, semantic_secondary, semantic_confidence = classify_intent_semantic(message, has_attachment)
+
+        if semantic_confidence >= 0.75:
+            logger.debug(
+                f"[classifier] semantic match: {semantic_primary.value} "
+                f"conf={semantic_confidence:.2f} (skipped LLM)"
+            )
+            return semantic_primary, semantic_secondary, semantic_confidence
+    except Exception as e:
+        logger.debug(f"[classifier] semantic classification failed: {e}")
 
     # ── Step 3: LLM classification for ambiguous cases ────────────────────
     # Use fast model if configured; fall back to main model

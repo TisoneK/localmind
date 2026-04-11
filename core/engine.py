@@ -293,7 +293,7 @@ class Engine:
         # ── 6. Tool dispatch ───────────────────────────────────────────
         tool_result: Optional[ToolResult] = None
 
-        # CRITICAL: FILE_TASK, SHELL, and WEB_SEARCH always call real tools.
+        # CRITICAL: FILE_TASK, SHELL, WEB_SEARCH, and SYSINFO always call real tools.
         # These are handled directly — NOT through the agent loop.
         #
         # WEB_SEARCH specifically: the agent loop adds 2–3 LLM round-trips
@@ -302,7 +302,11 @@ class Engine:
         # producing the "Ollama timed out after 300s" failure before the user
         # ever sees a result.  Direct dispatch runs the tool immediately, then
         # streams the result through the normal chat path — one LLM call total.
-        if effective_intent in (Intent.FILE_TASK, Intent.SHELL, Intent.WEB_SEARCH):
+        #
+        # SYSINFO: instant offline tool — time, date, system specs. Must never
+        # fall through to the else branch (which sets tool_result=None and lets
+        # the LLM hallucinate the answer).
+        if effective_intent in (Intent.FILE_TASK, Intent.SHELL, Intent.WEB_SEARCH, Intent.SYSINFO):
             logger.info(f"[engine] Direct tool dispatch for {effective_intent.value} - preventing hallucination")
             t_tool = time.monotonic()
             try:

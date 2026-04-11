@@ -33,6 +33,11 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "mixtral:8x7b": 32768,
     "phi3:mini": 4096,
     "gemma2:9b": 8192,
+    # Gemma 3 family — Ollama default context is 2048 for :1b, 8192 for larger
+    "gemma3:1b": 2048,
+    "gemma3:4b": 8192,
+    "gemma3:12b": 8192,
+    "gemma3:27b": 8192,
 }
 
 
@@ -41,6 +46,7 @@ class OllamaAdapter(BaseAdapter):
         self._base_url = settings.ollama_base_url.rstrip("/")
         self._model = model_override if model_override else settings.ollama_model
         self._timeout = settings.ollama_timeout
+        self._keep_alive = settings.ollama_keep_alive
         self._client = httpx.AsyncClient(timeout=self._timeout)
 
     @property
@@ -60,6 +66,11 @@ class OllamaAdapter(BaseAdapter):
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            "keep_alive": self._keep_alive,
+            # Tell Ollama the context window to use — prevents it silently
+            # truncating to its own default (e.g. 2048 for gemma3:1b) when the
+            # model supports more.
+            "options": {"num_ctx": self.context_window},
         }
 
         try:
@@ -101,6 +112,34 @@ class OllamaAdapter(BaseAdapter):
             )
             logger.error(msg)
             yield StreamChunk(text=msg, done=True, error=msg)
+
+    async def warmup(self) -> bool:
+        """
+        Pre-load the model into VRAM using Ollama's native /api/generate endpoint.
+
+        Ollama's documented "load model without generating" form: send model +
+        keep_alive with NO prompt key at all. An empty-string prompt triggers a
+        400; omitting the key entirely is what tells Ollama to load and hold the
+        model without producing any tokens.
+
+        Returns True if the model loaded successfully, False otherwise.
+        """
+        url = f"{self._base_url}/api/generate"
+        payload = {
+            "model": self._model,
+            "keep_alive": self._keep_alive,
+        }
+        try:
+            response = await self._client.post(url, json=payload, timeout=60)
+            ok = response.status_code == 200
+            if ok:
+                logger.info("[adapter] model '%s' pre-loaded (keep_alive=%s)", self._model, self._keep_alive)
+            else:
+                logger.warning("[adapter] warmup returned %s for model '%s'", response.status_code, self._model)
+            return ok
+        except Exception as exc:
+            logger.warning("[adapter] warmup failed for model '%s': %s", self._model, exc)
+            return False
 
     async def health_check(self) -> bool:
         try:

@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
+    ollama_embed_model: str = "nomic-embed-text"  # pin via OLLAMA_EMBED_MODEL in .env
     ollama_timeout: int = 120
+    ollama_keep_alive: str = "-1"   # -1 = keep model loaded forever; e.g. "5m", "1h"
 
     # Adapter
     localmind_adapter: str = "ollama"
@@ -109,11 +111,18 @@ class Settings(BaseSettings):
 
     def resolve_paths(self) -> None:
         """Resolve dynamic paths after init. Call once at startup."""
-        home = Path(self.localmind_home)
+        home = Path(self.localmind_home).expanduser()
         home.mkdir(parents=True, exist_ok=True)
-        Path(self.localmind_uploads_path).mkdir(parents=True, exist_ok=True)
+        Path(self.localmind_uploads_path).expanduser().mkdir(parents=True, exist_ok=True)
         if not self.localmind_db_path:
             self.localmind_db_path = str(home / "localmind.db")
+        else:
+            # Expand ~ and convert relative paths to absolute so VectorStore
+            # always opens the same file regardless of working directory.
+            p = Path(self.localmind_db_path).expanduser()
+            if not p.is_absolute():
+                p = (home / p).resolve()
+            self.localmind_db_path = str(p)
 
     def allowed_read_paths(self) -> list[Path]:
         return [Path(p) for p in _allowed_user_folders()]
