@@ -31,6 +31,7 @@ Improvements over v0.3:
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -190,37 +191,41 @@ class Engine:
         # ── 1. History ────────────────────────────────────────────────────
         history = self._store.get_history(session_id)
 
-        # ── 1a. Fast-path: obvious CHAT bypasses full pipeline ─────────────
+        # ── 1a. Intent classification (rule-based, instant) ──────────────────
         has_attachment = file is not None
         from core import intent_router as _router
+        from core.intent_router import _OBVIOUS_CHAT_PATTERNS
         _fast_primary, _fast_secondary = _router.classify_multi(message, has_attachment)
 
-        # Memory-hint check: bypass fast-path if message likely references past context
         _memory_hint_words = {"earlier", "before", "last time", "you said", "remember", "told you", "previous"}
         _has_memory_hint = any(w in message.lower() for w in _memory_hint_words)
 
-        print(f"[DEBUG] Fast-path check: primary={_fast_primary}, has_attachment={has_attachment}, has_memory_hint={_has_memory_hint}")
-        if _fast_primary == Intent.CHAT and not has_attachment and not _has_memory_hint:
-            print(f"[DEBUG] CHAT fast-path triggered!")
+        logger.debug("Intent check: primary=%s has_attachment=%s memory_hint=%s",
+                     _fast_primary, has_attachment, _has_memory_hint)
+
+        # ── 1b. Obvious greetings/acks → instant response, no tool needed ────
+        # Only exact-match social openers like "hi", "thanks", "bye" skip tools.
+        # Everything else — including CHAT — gets tool-aware routing below.
+        _stripped = message.strip()
+        _is_obvious_chat = (
+            _fast_primary == Intent.CHAT
+            and not has_attachment
+            and not _has_memory_hint
+            and any(re.fullmatch(p, _stripped, re.IGNORECASE) for p in _OBVIOUS_CHAT_PATTERNS)
+        )
+        if _is_obvious_chat:
             from core.intent_classifier import _RULE_CONFIDENCE_BY_INTENT
             _fast_conf = _RULE_CONFIDENCE_BY_INTENT.get(Intent.CHAT.value, 0.85)
             _obs.emit("intent_classified", primary="chat", secondary="none", confidence=_fast_conf)
             ctx = EngineContext(
-                session_id=session_id,
-                message=message,
-                intent=Intent.CHAT,
-                history=history,
-                tool_result=None,
-                file_attachment=None,
-                memory_facts=[],
+                session_id=session_id, message=message, intent=Intent.CHAT,
+                history=history, tool_result=None, file_attachment=None, memory_facts=[],
             )
             prompt_messages = context_builder.build(ctx, self._adapter.context_window)
             full_response: list[str] = []
-            async for chunk in self._adapter.chat(prompt_messages):
+            async for chunk in self._adapter.chat(prompt_messages, intent="chat"):
                 full_response.append(chunk.text)
-                # Filter at chunk level so leaks never reach the client
-                safe_text = _filter_system_leaks(chunk.text)
-                yield StreamChunk(text=safe_text, done=chunk.done)
+                yield StreamChunk(text=_filter_system_leaks(chunk.text), done=chunk.done)
             response_text = _filter_system_leaks("".join(full_response))
             self._store.append(session_id, Message(role=Role.USER, content=message))
             self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
@@ -228,9 +233,20 @@ class Engine:
             self._metrics.record("chat", latency_ms=total_ms, success=True)
             _obs.emit("turn_complete", intent="chat", confidence=_fast_conf,
                       tokens_approx=_approx_tokens(response_text),
-                      total_latency_ms=total_ms,
-                      memory_facts=0, agent_mode=False)
+                      total_latency_ms=total_ms, memory_facts=0, agent_mode=False)
             return
+
+        # ── 1c. CHAT with tool awareness — model decides whether to use a tool ─
+        # When the router says CHAT but it's not an obvious greeting, we route
+        # through the full pipeline (steps 2-10) so the correct tool can fire.
+        # This handles "whats the time?", "read my file", ambiguous queries etc.
+        # The router result is used as a hint; LLM classification in step 2 may
+        # refine it. We do NOT force CHAT — we let the pipeline decide.
+        #
+        # While a tool runs the user sees an animated tool step immediately so they
+        # know something is happening rather than waiting on a blank screen.
+        # Status is emitted via obs tool_status events (not text) so it never
+        # pollutes the response content and collapses cleanly after completion.
 
         # ── 2. LLM Intent Classification ──────────────────────────────────
         primary_intent, secondary_intent, confidence = await classify_with_llm(
@@ -306,8 +322,22 @@ class Engine:
         # SYSINFO: instant offline tool — time, date, system specs. Must never
         # fall through to the else branch (which sets tool_result=None and lets
         # the LLM hallucinate the answer).
+        _TOOL_LABELS = {
+            Intent.WEB_SEARCH: "Searching the web",
+            Intent.FILE_TASK:  "Reading file",
+            Intent.FILE_WRITE: "Writing file",
+            Intent.CODE_EXEC:  "Running code",
+            Intent.SHELL:      "Running command",
+            Intent.SYSINFO:    "Getting system info",
+            Intent.MEMORY_OP:  "Checking memory",
+        }
+
         if effective_intent in (Intent.FILE_TASK, Intent.SHELL, Intent.WEB_SEARCH, Intent.SYSINFO):
-            logger.info(f"[engine] Direct tool dispatch for {effective_intent.value} - preventing hallucination")
+            # Emit a tool_status obs event — renders as an animated ToolStep in the UI,
+            # disappears when the response arrives. Never touches the text content stream.
+            label = _TOOL_LABELS.get(effective_intent, effective_intent.value)
+            _obs.emit("tool_status", tool=effective_intent.value, label=label, status="running")
+            logger.info("[engine] Direct tool dispatch for %s", effective_intent.value)
             t_tool = time.monotonic()
             try:
                 tool_result = await dispatch(effective_intent, message)
@@ -327,7 +357,25 @@ class Engine:
                 _obs.emit("tool_dispatched", tool=effective_intent.value, success=bool(tool_result), latency_ms=tool_latency)
                 record_tool_outcome(self._store, effective_intent.value, success=bool(tool_result), latency_ms=tool_latency)
                 self._metrics.record(effective_intent.value, latency_ms=tool_latency, success=bool(tool_result))
-                
+
+                # SYSINFO: stream the raw result directly — no LLM reformatting.
+                # The data is factual and structured; passing it through the LLM
+                # on a small context window causes hallucination (model ignores the
+                # injected result and answers from its training data instead).
+                if effective_intent == Intent.SYSINFO and tool_result and tool_result.content:
+                    result_text = tool_result.content.strip()
+                    _obs.emit("tool_status", tool="sysinfo", label="Getting system info", status="done")
+                    self._store.append(session_id, Message(role=Role.USER, content=message))
+                    self._store.append(session_id, Message(role=Role.ASSISTANT, content=result_text))
+                    total_ms = round((time.monotonic() - t0) * 1000)
+                    self._metrics.record("sysinfo", latency_ms=total_ms, success=True)
+                    _obs.emit("turn_complete", intent="sysinfo", confidence=round(confidence, 2),
+                              tokens_approx=_approx_tokens(result_text), total_latency_ms=total_ms,
+                              memory_facts=0, agent_mode=False)
+                    yield StreamChunk(text=result_text, done=False)
+                    yield StreamChunk(text="", done=True)
+                    return
+
             except Exception as e:
                 logger.error(f"Direct tool dispatch failed for {effective_intent.value}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])
@@ -364,6 +412,8 @@ class Engine:
 
         if effective_intent in AGENT_INTENTS:
             _obs.emit("agent_loop_start", intent=effective_intent.value)
+            label = _TOOL_LABELS.get(effective_intent, effective_intent.value)
+            _obs.emit("tool_status", tool=effective_intent.value, label=label, status="running")
             async for chunk in self._agent_loop.run(
                 messages=prompt_messages,
                 intent=effective_intent,
@@ -377,12 +427,16 @@ class Engine:
                 full_response_chunks.append(safe_text)
                 yield StreamChunk(text=safe_text, done=chunk.done)
         else:
-            async for chunk in active_adapter.chat(prompt_messages):
+            async for chunk in active_adapter.chat(prompt_messages, intent=effective_intent.value):
                 safe_text = _filter_system_leaks(chunk.text)
                 full_response_chunks.append(safe_text)
                 yield StreamChunk(text=safe_text, done=chunk.done)
 
         response_text = "".join(full_response_chunks)
+        # Collapse the running tool status indicator now that we have a response
+        if effective_intent in _TOOL_LABELS:
+            _obs.emit("tool_status", tool=effective_intent.value,
+                      label=_TOOL_LABELS[effective_intent], status="done")
 
         # ── 8. Secondary intent ────────────────────────────────────────────
         if secondary_intent:

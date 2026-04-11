@@ -17,7 +17,25 @@ import httpx
 
 from adapters.base import BaseAdapter
 from core.config import settings
-from core.models import StreamChunk
+from core.models import StreamChunk, Intent
+
+# Per-intent timeout overrides (seconds).
+# CHAT is fast; tool-heavy intents need more time.
+def _build_intent_timeouts() -> dict[str, int]:
+    """Read per-intent timeouts from settings so .env changes take effect on restart."""
+    return {
+        "chat":       settings.ollama_timeout_chat,
+        "web_search": settings.ollama_timeout_web_search,
+        "file_task":  settings.ollama_timeout_file_task,
+        "file_write": settings.ollama_timeout_file_write,
+        "shell":      settings.ollama_timeout_shell,
+        "code_exec":  settings.ollama_timeout_code_exec,
+        "sysinfo":    settings.ollama_timeout_sysinfo,
+        "memory_op":  settings.ollama_timeout_memory_op,
+    }
+
+_INTENT_TIMEOUTS: dict[str, int] = _build_intent_timeouts()
+_DEFAULT_TIMEOUT: int = settings.ollama_timeout_default
 
 logger = logging.getLogger(__name__)
 
@@ -44,37 +62,41 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 class OllamaAdapter(BaseAdapter):
     def __init__(self, model_override: str = ""):
         self._base_url = settings.ollama_base_url.rstrip("/")
-        self._model = model_override if model_override else settings.ollama_model
+        # Strip inline .env comments — pydantic-settings doesn't do this by default
+        raw = model_override if model_override else settings.ollama_model
+        self._model = raw.split("#")[0].strip()
         self._timeout = settings.ollama_timeout
         self._keep_alive = settings.ollama_keep_alive
         self._client = httpx.AsyncClient(timeout=self._timeout)
 
     @property
     def context_window(self) -> int:
-        base_model = self._model.split(":")[0] + ":" + self._model.split(":")[1] if ":" in self._model else self._model
-        return _MODEL_CONTEXT_WINDOWS.get(self._model, _MODEL_CONTEXT_WINDOWS.get(base_model, 8192))
+        # Strip any inline comment that pydantic-settings may have included
+        # e.g. 'gemma3:1b   # comment' → 'gemma3:1b'
+        model = self._model.split("#")[0].strip()
+        base_model = model.split(":")[0] if ":" not in model else model
+        return _MODEL_CONTEXT_WINDOWS.get(model, _MODEL_CONTEXT_WINDOWS.get(base_model, 8192))
 
     async def chat(
         self,
         messages: list[dict],
         temperature: float = 0.7,
+        intent: str = "chat",
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
         url = f"{self._base_url}/v1/chat/completions"
+        timeout = _INTENT_TIMEOUTS.get(intent, _DEFAULT_TIMEOUT)
         payload = {
             "model": self._model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
             "keep_alive": self._keep_alive,
-            # Tell Ollama the context window to use — prevents it silently
-            # truncating to its own default (e.g. 2048 for gemma3:1b) when the
-            # model supports more.
             "options": {"num_ctx": self.context_window},
         }
 
         try:
-            async with self._client.stream("POST", url, json=payload) as response:
+            async with self._client.stream("POST", url, json=payload, timeout=timeout) as response:
                 if response.status_code != 200:
                     body = await response.aread()
                     error_msg = f"Ollama returned {response.status_code}: {body.decode()[:200]}"
@@ -107,7 +129,7 @@ class OllamaAdapter(BaseAdapter):
             yield StreamChunk(text=msg, done=True, error=msg)
         except httpx.TimeoutException:
             msg = (
-                f"Ollama timed out after {self._timeout}s. "
+                f"Ollama timed out after {timeout}s. "
                 "The model may still be loading -- please try again in a moment."
             )
             logger.error(msg)

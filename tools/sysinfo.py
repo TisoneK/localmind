@@ -27,10 +27,11 @@ def _get_system_info(query: str) -> str:
     q = query.lower()
     parts = []
 
-    # Always include time + date — most common query
-    now = datetime.datetime.now()
-    parts.append(f"Current date/time: {now.strftime('%A, %B %d, %Y  %I:%M:%S %p')}")
-    parts.append(f"Timezone: {datetime.datetime.now(datetime.timezone.utc).astimezone().tzname()}")
+    # Always include time + date — use local timezone explicitly
+    now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+    tz_name = now.tzname() or "local"
+    utc_offset = now.strftime("%z")  # e.g. +0300
+    parts.append(f"Current date/time: {now.strftime('%A, %B %d, %Y  %I:%M:%S %p')} ({tz_name}, UTC{utc_offset})")
 
     wants_specs = any(w in q for w in [
         "spec", "cpu", "ram", "memory", "disk", "storage", "os", "system",

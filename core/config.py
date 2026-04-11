@@ -102,6 +102,17 @@ class Settings(BaseSettings):
     ollama_model_fast: str = ""
     ollama_model_code: str = ""
 
+    # Intent-specific timeouts (seconds) — override per model/environment in .env
+    ollama_timeout_chat: int = 90
+    ollama_timeout_web_search: int = 180
+    ollama_timeout_file_task: int = 180
+    ollama_timeout_file_write: int = 180
+    ollama_timeout_shell: int = 180
+    ollama_timeout_code_exec: int = 240
+    ollama_timeout_sysinfo: int = 60
+    ollama_timeout_memory_op: int = 120
+    ollama_timeout_default: int = 180
+
     # Agent loop
     localmind_agent_enabled: bool = True
     localmind_agent_max_iterations: int = 6

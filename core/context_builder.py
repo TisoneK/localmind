@@ -378,55 +378,29 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     # tool.  Falls back to in-code constants if fragment files are missing.
     active_system_prompt = build_system_prompt(context.intent, model_context_window)
 
-    # Load knowledge doc once — used for both budget accounting and injection.
-    # Guard: skip injection if the knowledge doc would consume more than 60% of
-    # the total context window (protects phi3:mini's tight 4096-token budget).
-    knowledge = _load_knowledge_doc()
-    knowledge_tokens = _count_tokens(knowledge) if knowledge else 0
-    if knowledge and knowledge_tokens > model_context_window * 0.60:
-        logger.warning(
-            "[context_builder] knowledge doc (%d tokens) exceeds 60%% of context window (%d) — "
-            "skipping injection. Consider a larger model or trimming localmind.md.",
-            knowledge_tokens, model_context_window,
-        )
-        knowledge = ""
-        knowledge_tokens = 0
+    # Knowledge doc (localmind.md) is only injected when the context window is
+    # large enough to absorb it without crowding out history and tool results.
+    # Skip entirely for small-context models — no warning spam, no wasted cycles.
+    knowledge = ""
+    knowledge_tokens = 0
+    if model_context_window > _COMPACT_PROMPT_THRESHOLD:
+        knowledge = _load_knowledge_doc()
+        knowledge_tokens = _count_tokens(knowledge) if knowledge else 0
+        if knowledge and knowledge_tokens > model_context_window * 0.60:
+            knowledge = ""
+            knowledge_tokens = 0
 
     base_system_tokens = _count_tokens(active_system_prompt) + 4
     if knowledge:
-        # Knowledge doc is injected unconditionally — reserve its tokens up front
-        # so tool results and history can't silently overflow the context window.
         base_system_tokens += knowledge_tokens + 4
 
-    # Total tokens available after reserving space for the model's response
-    total_available = (
+    total_available = max(
         model_context_window
         - settings.localmind_response_reserve_tokens
         - base_system_tokens
-        - 16  # structural buffer
+        - 16,
+        64,  # hard floor — always fit at least the current message
     )
-
-    # Safety guard: if the system prompt alone already exceeds the context window
-    # (can happen with small models like gemma3:1b), drop the knowledge doc and
-    # recalculate so we always have at least a minimal positive budget.
-    if total_available < 256 and knowledge:
-        logger.warning(
-            "[context_builder] context window too tight (%d tokens available) after "
-            "knowledge doc injection — dropping localmind.md to recover budget.",
-            total_available,
-        )
-        base_system_tokens -= (knowledge_tokens + 4)
-        knowledge = ""
-        knowledge_tokens = 0
-        total_available = (
-            model_context_window
-            - settings.localmind_response_reserve_tokens
-            - base_system_tokens
-            - 16
-        )
-
-    # Hard floor: always leave at least 64 tokens for history + current message
-    total_available = max(total_available, 64)
 
     # Per-component budgets
     tool_budget    = round(total_available * TOOL_RESULT_BUDGET_FRACTION)

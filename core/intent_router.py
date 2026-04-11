@@ -69,9 +69,15 @@ class IntentRule:
 # ── Pattern lists ─────────────────────────────────────────────────────────────
 
 _SYSINFO_PATTERNS = [
-    r"\b(what (is|'?s) the (time|date|day|year|month))\b",
-    r"\b(what time|current time|today'?s date|what day)\b",
-    r"\b(time (is it|now)|date (today|now|is it))\b",
+    # Time/date — covers: "what time", "whats the time", "what's the time",
+    # "what is the time", "time is it", "current time", "what day is it" etc.
+    r"\bwhat'?s? (the )?(time|date|day|year|month)\b",
+    r"\bwhat (is |are )?(the )?(time|date|day|year|month)\b",
+    r"\b(current time|current date|today'?s date|what day)\b",
+    r"\b(time (is it|now|right now)|date (today|now|is it))\b",
+    r"\b(tell me the (time|date|day))\b",
+    r"\bwhat (time|day|date) is it\b",
+    # Hardware / system specs
     r"\b(my (pc|computer|machine|laptop|system) (spec|info|detail|hardware))\b",
     r"\b(how much (ram|memory|storage|disk)|cpu (speed|cores|info|usage))\b",
     r"\b(os version|operating system|system info|pc spec|computer spec)\b",

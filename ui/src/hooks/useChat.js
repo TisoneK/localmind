@@ -78,6 +78,26 @@ export function useChat(initialSessionId) {
         message: text,
         sessionId,
         file: currentFile,
+        onToolStatus: ({ tool, label, status }) => {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== streamingIdRef.current) return m
+              const existing = m.toolSteps.findIndex(s => s.action === tool)
+              if (existing >= 0) {
+                // Update existing step status
+                const updated = m.toolSteps.map((s, i) =>
+                  i === existing ? { ...s, status } : s
+                )
+                return { ...m, toolSteps: updated }
+              }
+              // Add new step
+              return {
+                ...m,
+                toolSteps: [...m.toolSteps, { action: tool, input: label, status }],
+              }
+            })
+          )
+        },
         onChunk: (chunk) => {
           setMessages((prev) =>
             prev.map((m) => {
