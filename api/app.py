@@ -73,7 +73,16 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         logger.info(f"LocalMind — model: {settings.ollama_model} | ui: {UI_HTML.exists()}")
-        
+
+        # Single authoritative startup: warms LLM router, embed model,
+        # RiskAwareRouter, and FlywheelLogger on the exact engine instance
+        # that handles requests. Replaces orphan VectorStore warm-ups below.
+        from api.routes.chat import _engine as _chat_engine
+        await _chat_engine.startup()
+        from api.routes.health import set_engine_ready
+        set_engine_ready()
+        logger.info("[startup] engine ready — accepting requests")
+
         # Background task to pre-warm VectorStore
         async def warm_vector_store():
             try:

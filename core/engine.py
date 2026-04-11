@@ -42,7 +42,8 @@ from core.models import (
 from core.config import settings
 from core import context_builder
 from core.summarizer import maybe_compress_history
-from core.intent_classifier import classify_with_llm
+from core.intent_router_v2 import RiskAwareRouter, ZONE_AMBER, ZONE_RED
+from core.flywheel import FlywheelLogger
 from core.memory import MemoryComposer
 from core.agent import AgentLoop, AGENT_INTENTS
 from core.tool_scorer import best_tool, score_tools, load_reliability_from_db, record_tool_outcome
@@ -122,6 +123,8 @@ class Engine:
         self._memory = MemoryComposer()
         self._agent_loop = AgentLoop(adapter=self._adapter)
         self._metrics = MetricsStore()
+        self._flywheel = FlywheelLogger()
+        self._router = RiskAwareRouter(flywheel=self._flywheel)
         # Per-session intent history: {session_id: [intent_value, ...]}
         self._intent_history: dict[str, list[str]] = {}
         # Reliability bootstrap happens in startup(), not here
@@ -146,6 +149,14 @@ class Engine:
             logger.info(f"[engine] model router refreshed: {len(pulled)} models available")
         except Exception as e:
             logger.warning(f"[engine] model router refresh failed (non-fatal): {e}")
+
+        # Pre-warm the embedding model so the first memory retrieval call
+        # (step 5) doesn't cold-load Ollama and hang for 180s.
+        try:
+            await self._memory._store.warmup()
+            logger.info("[engine] vector store embedding model warmed up")
+        except Exception as e:
+            logger.warning(f"[engine] vector store warmup failed (non-fatal): {e}")
 
     def _adapter_for(self, intent: Intent):
         """Return an adapter configured with the best model for this intent."""
@@ -248,16 +259,25 @@ class Engine:
         # Status is emitted via obs tool_status events (not text) so it never
         # pollutes the response content and collapses cleanly after completion.
 
-        # ── 2. LLM Intent Classification ──────────────────────────────────
-        primary_intent, secondary_intent, confidence = await classify_with_llm(
+        # ── 2. Risk-Aware Intent Routing (replaces classify_with_llm) ────────
+        # Runs rule engine + LLM concurrently. LLM is capped at 5s.
+        # Returns a RoutingDecision with zone, confidence, and uncertainty flag.
+        # obs events are emitted inside route() — no duplicate emit needed here.
+        import uuid as _uuid
+        _query_id = _uuid.uuid4().hex
+        routing = await self._router.route(
             message=message,
             has_attachment=has_attachment,
             adapter=self._adapter,
+            obs=_obs,
+            session_id=session_id,
+            query_id=_query_id,
         )
-        _obs.emit("intent_classified",
-                  primary=primary_intent.value,
-                  secondary=secondary_intent.value if secondary_intent else "none",
-                  confidence=round(confidence, 2))
+        primary_intent   = routing.intent
+        secondary_intent = routing.secondary
+        confidence       = routing.confidence
+        _routing_zone    = routing.zone
+        _routing_uncertain = routing.uncertain
 
         # ── 3. Tool Scoring ────────────────────────────────────────────────
         tools = available_tools()
@@ -379,6 +399,8 @@ class Engine:
             except Exception as e:
                 logger.error(f"Direct tool dispatch failed for {effective_intent.value}: {e}")
                 _obs.emit("tool_failed", tool=effective_intent.value, error=str(e)[:80])
+                # Structural feedback: tool dispatch failure → label this routing as wrong.
+                self._flywheel.mark_tool_failure(_query_id)
                 tool_result = None
         
         # Agent intents (WEB_SEARCH, CODE_EXEC, FILE_WRITE, MEMORY_OP) get tool result in agent loop
@@ -409,6 +431,20 @@ class Engine:
 
         # ── 7a/7b. Stream response ─────────────────────────────────────────
         full_response_chunks: list[str] = []
+
+        # Red-zone CHAT fallback: prepend a visible uncertainty preamble so the
+        # user knows the system is guessing rather than silently hallucinating.
+        # This preamble is injected as a text chunk BEFORE the LLM stream starts,
+        # so it appears immediately even if the model is slow.
+        if (
+            _routing_uncertain
+            and _routing_zone == "red"
+            and effective_intent == Intent.CHAT
+            and not tool_result
+        ):
+            _preamble = "_(Not entirely sure — here's my best answer.)_ "
+            full_response_chunks.append(_preamble)
+            yield StreamChunk(text=_preamble, done=False)
 
         if effective_intent in AGENT_INTENTS:
             _obs.emit("agent_loop_start", intent=effective_intent.value)

@@ -23,6 +23,8 @@ import { ErrorBanner }         from './components/ErrorBanner'
 import { ObservabilityPanel }  from './components/ObservabilityPanel'
 import { useChat }             from './hooks/useChat'
 import { useSession }          from './hooks/useSession'
+import { useHealth }           from './hooks/useHealth'
+import { BootSplash }          from './components/BootSplash'
 
 const S = {
   root: {
@@ -44,6 +46,7 @@ export default function App() {
    */
   const [currentSessionId, setCurrentSessionId] = useState(null)
   const { sessions, refreshSessions } = useSession()
+  const { engineReady, health, error: healthError } = useHealth()
 
   const {
     messages,
@@ -94,6 +97,8 @@ export default function App() {
   }, [send, currentSessionId, sessionId, refreshSessions])
 
   return (
+    <>
+      <BootSplash engineReady={engineReady} health={health} error={healthError} />
     <div style={S.root}>
       <StatusBar onNewChat={handleNewChat} sessionId={currentSessionId || sessionId} />
       <ErrorBanner error={error} onDismiss={() => {}} />
@@ -119,5 +124,6 @@ export default function App() {
         <ObservabilityPanel observabilityData={observabilityData} />
       </div>
     </div>
+    </>
   )
 }
