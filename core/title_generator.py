@@ -1,191 +1,109 @@
 """
 Title Generation Subsystem
 
-Provides deterministic and LLM-enhanced title generation for sessions.
+Two-stage approach:
+  Stage 1 (sync, instant): keyword/intent heuristic → placeholder title stored immediately
+  Stage 2 (async, ~2s):    LLM call → concise title overwrites the placeholder
+
+Stage 2 fires as a background asyncio task so it never blocks the response stream.
 """
 from __future__ import annotations
 import asyncio
 import logging
 from typing import Optional
 
-from adapters.ollama import OllamaAdapter
-from storage.db import SessionStore
-from core.config import settings
-
 logger = logging.getLogger(__name__)
 
 
+# ── Stage 1: instant heuristic placeholder ────────────────────────────────────
+
 def generate_title_smart(message: str, intent: str | None = None) -> str:
-    """Generate semantic, intent-aware title from user message."""
+    """
+    Fast synchronous placeholder title — used immediately so the sidebar
+    shows something while the LLM-generated title is being computed.
+    Returns a short cleaned version of the user message, max 35 chars.
+    """
     if not message:
         return "New Chat"
 
-    msg = message.lower()
-
-    # Intent-driven titles (high signal)
-    if intent == "file_processing":
-        return "Document Analysis"
-
-    if intent == "image_processing":
-        return "Image Analysis"
-
-    if intent == "web_search":
-        return "News / Web Search"
-
-    if intent == "code_generation":
-        return "Code Generation"
-
-    if intent == "chat":
-        # fall through to semantic extraction
-        pass
-
-    # Pattern-based semantic extraction
-    if "hello world" in msg:
-        return "Hello World Program"
-
-    if "news" in msg or "latest" in msg:
-        return "Latest News"
-
-    if "analyze" in msg or "analysis" in msg:
-        return "Analysis Request"
-
-    if "report" in msg:
-        return "Report Generation"
-
-    if "time" in msg and ("what" in msg or "current" in msg):
-        return "Time Check"
-
-    if "file" in msg or "attached" in msg:
-        return "File Analysis"
-
-    if "image" in msg or "jpeg" in msg or "png" in msg:
-        return "Image Analysis"
-
-    if "vs" in msg or "versus" in msg:
-        # Extract matchup pattern
-        words = message.split()
-        if len(words) >= 3:
-            for i, word in enumerate(words):
-                if word.lower() in ["vs", "versus"]:
-                    if i > 0 and i < len(words) - 1:
-                        return f"{words[i-1]} vs {words[i+1]}"
-
-    # Political/Government patterns
-    if ("president" in msg or "government" in msg or "politics" in msg or 
-        "election" in msg or "congress" in msg or "senate" in msg):
-        return "Political Inquiry"
-
-    if ("who" in msg and ("president" in msg or "leader" in msg)) or "current president" in msg:
-        return "Presidential Question"
-
-    # Time/Date patterns
-    if ("what time" in msg or "current time" in msg) or ("time" in msg and ("what" in msg or "current" in msg)):
-        return "Time Check"
-
-    # Location/Geography patterns
-    if ("where" in msg or "location" in msg or "address" in msg or "map" in msg):
-        return "Location Query"
-
-    # Definition/Explanation patterns
-    if ("what is" in msg or "define" in msg or "explain" in msg or "meaning" in msg):
-        return "Definition Request"
-
-    # How-to patterns
-    if ("how to" in msg or "how do" in msg or "steps" in msg or "tutorial" in msg):
-        return "How-To Guide"
-
-    # Comparison patterns
-    if ("difference" in msg or "compare" in msg or "better" in msg or "versus" in msg):
-        return "Comparison Analysis"
-
-    # Fallback (cleaned + shortened)
     clean = message.strip()
-    
-    # Remove common prefixes
-    prefixes = [
-        "please", "kindly", "help me", "can you", "i want to",
-        "could you", "would you", "i need", "can i", "how do i"
-    ]
-    for p in prefixes:
-        if clean.lower().startswith(p):
-            clean = clean[len(p):].strip()
 
-    # Remove leading articles
-    articles = ["a ", "an ", "the "]
-    for article in articles:
-        if clean.lower().startswith(article):
-            clean = clean[len(article):].strip()
+    # Strip common leading filler words
+    import re
+    clean = re.sub(
+        r"^(please|kindly|help me|can you|could you|would you|i need|i want to"
+        r"|i'd like|tell me|show me|write me|give me|create a?|generate a?|make a?)\s+",
+        "", clean, flags=re.IGNORECASE
+    ).strip()
 
-    # Truncate if too long
-    if len(clean) > 40:
-        clean = clean[:37] + "..."
+    # Strip leading articles
+    clean = re.sub(r"^(a|an|the)\s+", "", clean, flags=re.IGNORECASE).strip()
+
+    # Truncate
+    if len(clean) > 35:
+        # Try to cut at a word boundary
+        cut = clean[:32].rsplit(" ", 1)[0]
+        clean = cut + "…"
 
     return clean.capitalize() if clean else "New Chat"
 
 
-def generate_title_basic(text: str) -> str:
-    """Legacy title generator - use generate_title_smart instead."""
-    return generate_title_smart(text)
+# ── Stage 2: async LLM title ──────────────────────────────────────────────────
 
+async def refine_title_async(session_id: str, message: str) -> None:
+    """
+    Generate a concise LLM title for the session and write it to the DB.
+    Called as a fire-and-forget background task after the first turn completes.
+    Uses the same Ollama adapter as the main engine — no separate HTTP client.
+    """
+    from storage.db import SessionStore
+    from core.config import settings
+    from adapters.ollama import OllamaAdapter
 
-async def refine_title_async(session_id: str) -> None:
-    """Asynchronously refine session title using LLM."""
     try:
+        prompt_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a title generator. Given a user message, produce a short title "
+                    "of 2–5 words that captures the topic. Output ONLY the title — no quotes, "
+                    "no punctuation at the end, no explanation."
+                ),
+            },
+            {"role": "user", "content": message[:300]},  # cap to avoid blowing context
+        ]
+
+        adapter = OllamaAdapter()
+        chunks: list[str] = []
+        async for chunk in adapter.chat(prompt_messages, temperature=0.3, intent="chat"):
+            if chunk.text:
+                chunks.append(chunk.text)
+
+        raw = "".join(chunks).strip()
+
+        # Sanitize: strip quotes, trailing punctuation, limit length
+        import re
+        raw = re.sub(r'^["\']|["\']$', "", raw).strip()
+        raw = re.sub(r'[.!?]+$', "", raw).strip()
+        if len(raw) > 50:
+            raw = raw[:47] + "…"
+
+        if not raw:
+            return
+
         store = SessionStore(settings.localmind_db_path)
-        messages = store.get_history(session_id, limit=3)  # Get first few messages
-        
-        if not messages:
-            return
+        store.update_session_title(session_id, raw)
+        logger.info(f"[title] LLM title for {session_id[:8]}: '{raw}'")
 
-        # Use first user message for context
-        first_user_msg = None
-        for msg in messages:
-            if msg.role.value == "user":
-                first_user_msg = msg.content
-                break
-        
-        if not first_user_msg:
-            return
-
-        prompt = f"""Summarize this user request in 3-6 words:
-
-{first_user_msg}
-
-Return only the title, nothing else."""
-
-        ollama = OllamaAdapter()
-        response = await ollama.generate(prompt)
-        
-        if response and response.strip():
-            refined_title = response.strip()[:50]  # Limit length
-            store.update_session_title(session_id, refined_title)
-            logger.info(f"Refined title for session {session_id}: {refined_title}")
-            
-    except Exception as e:
-        logger.warning(f"Failed to refine title for session {session_id}: {e}")
+    except Exception as exc:
+        logger.warning(f"[title] refine_title_async failed: {exc}")
 
 
 def should_generate_title(session_id: str, message_role: str) -> bool:
-    """Check if title should be generated for this message."""
-    if message_role != "user":
-        return False
-    
-    try:
-        store = SessionStore(settings.localmind_db_path)
-        sessions = store.list_sessions()
-        
-        # Find current session
-        current_session = None
-        for session in sessions:
-            if session["id"] == session_id:
-                current_session = session
-                break
-        
-        # Only generate if no title exists and this is the first user message
-        if current_session and current_session.get("title") is None:
-            return current_session.get("message_count", 0) <= 1
-            
-    except Exception as e:
-        logger.warning(f"Error checking title generation: {e}")
-    
-    return False
+    """Legacy compat — no longer used in main path."""
+    return message_role == "user"
+
+
+def generate_title_basic(text: str) -> str:
+    """Legacy compat."""
+    return generate_title_smart(text)

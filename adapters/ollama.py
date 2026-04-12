@@ -89,13 +89,22 @@ class OllamaAdapter(BaseAdapter):
     ) -> AsyncIterator[StreamChunk]:
         url = f"{self._base_url}/v1/chat/completions"
         timeout = _INTENT_TIMEOUTS.get(intent, _DEFAULT_TIMEOUT)
+        # Cap num_ctx for file_task and chat: a 1b model with 131k context
+        # allocates a huge KV cache and stalls. Use a practical ceiling.
+        _ctx_caps = {
+            "file_task": 8192,
+            "chat":      8192,
+            "memory_op": 4096,
+        }
+        num_ctx = min(self.context_window, _ctx_caps.get(intent, self.context_window))
+
         payload = {
             "model": self._model,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
             "keep_alive": self._keep_alive,
-            "options": {"num_ctx": self.context_window},
+            "options": {"num_ctx": num_ctx},
         }
 
         try:

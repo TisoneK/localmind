@@ -56,6 +56,23 @@ SHELL TOOL GUIDANCE:
         if t["intent"] in AGENT_ALLOWED_TOOLS
     )
 
+    # Chat mode: completely different prompt — no tool pressure, answer directly
+    if intent == Intent.CHAT:
+        return f"""You are LocalMind, a helpful AI assistant.
+
+{intent_ctx}OUTPUT FORMAT — respond with exactly this JSON on a SINGLE LINE, no extra text:
+{{"finish": {{"answer": "your answer here"}}}}
+
+RULES:
+- One line. No line breaks inside the JSON. No markdown fences. No preamble.
+- Answer directly from knowledge. Do NOT call any tools.
+- Write your full answer inside the answer field as a plain string.
+- Use \n for newlines inside the answer if needed.
+
+Example:
+{{"finish": {{"answer": "Jomo Kenyatta was the first president of Kenya, serving from 1964 to 1978."}}}}
+"""
+
     return f"""You are LocalMind's reasoning agent. You have tools available and MUST use them — never simulate or guess tool results.
 
 Available tools:

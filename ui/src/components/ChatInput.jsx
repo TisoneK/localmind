@@ -1,27 +1,56 @@
 import { useState, useRef, useCallback } from 'react'
 import { FileUpload } from './FileUpload'
 
+const C = {
+  bg:       '#0c0c10',
+  surface:  '#13131a',
+  border:   '#232333',
+  accent:   '#7c6af7',
+  green:    '#3ecf8e',
+  muted:    '#55558a',
+  faint:    '#35354a',
+  text:     '#e8e8f0',
+}
+
 const S = {
   outer: {
-    borderTop: '1px solid #1e1e2e',
-    background: '#0f0f12',
-    padding: '12px 16px 16px',
+    borderTop: `1px solid ${C.border}`,
+    background: C.bg,
+    padding: '10px 16px 14px',
+    flexShrink: 0,
   },
-  row: {
+  fileBadge: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '5px',
+    fontSize: '11px',
+    color: '#9090d0',
+    background: '#16162a',
+    border: '1px solid #2a2a50',
+    borderRadius: '6px',
+    padding: '3px 8px',
+    marginBottom: '8px',
+    maxWidth: '100%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  inputRow: {
     display: 'flex',
     alignItems: 'flex-end',
     gap: '8px',
-    background: '#1a1a26',
-    border: '1px solid #2a2a3e',
+    background: C.surface,
+    border: `1px solid ${C.border}`,
     borderRadius: '12px',
     padding: '8px 8px 8px 12px',
+    transition: 'border-color 0.15s',
   },
   textarea: {
     flex: 1,
     background: 'transparent',
     border: 'none',
     outline: 'none',
-    color: '#e2e2e8',
+    color: C.text,
     fontSize: '14px',
     lineHeight: 1.6,
     resize: 'none',
@@ -35,42 +64,41 @@ const S = {
     flexShrink: 0,
     width: '34px',
     height: '34px',
-    borderRadius: '8px',
+    borderRadius: '9px',
     border: 'none',
-    background: active ? '#22c55e' : '#2a2a3e',
-    color: active ? '#fff' : '#55556a',
+    background: active ? C.green : '#1a1a28',
+    color: active ? '#0a1a12' : C.faint,
     cursor: active ? 'pointer' : 'default',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    fontSize: '16px',
-    transition: 'background 0.15s',
+    fontSize: '15px',
+    fontWeight: 700,
+    transition: 'all 0.15s',
+    boxShadow: active ? `0 0 10px ${C.green}40` : 'none',
   }),
   stopBtn: {
     flexShrink: 0,
     width: '34px',
     height: '34px',
-    borderRadius: '8px',
-    border: '1px solid #3730a3',
-    background: '#1e1e3a',
-    color: '#a5b4fc',
+    borderRadius: '9px',
+    border: `1px solid ${C.border}`,
+    background: '#16161f',
+    color: C.muted,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    fontSize: '12px',
-  },
-  toolbar: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '8px',
-    marginBottom: '8px',
+    fontSize: '11px',
+    fontWeight: 700,
+    letterSpacing: '0.02em',
   },
   hint: {
-    fontSize: '11px',
-    color: '#35354a',
-    marginTop: '8px',
+    fontSize: '10.5px',
+    color: C.faint,
+    marginTop: '7px',
     textAlign: 'center',
+    letterSpacing: '0.01em',
   },
 }
 
@@ -78,31 +106,20 @@ export function ChatInput({ onSend, isStreaming, onStop, file, onFile }) {
   const [text, setText] = useState('')
   const textareaRef = useRef(null)
 
-  const handleKey = useCallback(
-    (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault()
-        submit()
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [text, isStreaming]
-  )
-
-  const submit = () => {
+  const submit = useCallback(() => {
     const trimmed = text.trim()
     if (!trimmed || isStreaming) return
     onSend(trimmed)
     setText('')
-    // Reset textarea height
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto'
-    }
-  }
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+  }, [text, isStreaming, onSend])
+
+  const handleKey = useCallback((e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
+  }, [submit])
 
   const handleInput = (e) => {
     setText(e.target.value)
-    // Auto-expand textarea
     const el = e.target
     el.style.height = 'auto'
     el.style.height = Math.min(el.scrollHeight, 160) + 'px'
@@ -113,12 +130,10 @@ export function ChatInput({ onSend, isStreaming, onStop, file, onFile }) {
   return (
     <div style={S.outer}>
       {file && (
-        <div style={S.toolbar}>
-          <FileUpload file={file} onFile={onFile} />
-        </div>
+        <div style={S.fileBadge}>📎 {file.name}</div>
       )}
-      <div style={S.row}>
-        {!file && <FileUpload file={file} onFile={onFile} />}
+      <div style={S.inputRow}>
+        <FileUpload file={file} onFile={onFile} />
         <textarea
           ref={textareaRef}
           style={S.textarea}
@@ -131,16 +146,9 @@ export function ChatInput({ onSend, isStreaming, onStop, file, onFile }) {
           autoFocus
         />
         {isStreaming ? (
-          <button style={S.stopBtn} onClick={onStop} title="Stop">
-            ■
-          </button>
+          <button style={S.stopBtn} onClick={onStop} title="Stop generation">■</button>
         ) : (
-          <button
-            style={S.sendBtn(canSend)}
-            onClick={submit}
-            disabled={!canSend}
-            title="Send (Enter)"
-          >
+          <button style={S.sendBtn(canSend)} onClick={submit} disabled={!canSend} title="Send (Enter)">
             ↑
           </button>
         )}

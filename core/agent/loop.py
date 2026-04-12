@@ -47,20 +47,32 @@ logger = logging.getLogger(__name__)
 
 # ── JSON parsing helpers ───────────────────────────────────────────────────────
 
+# Greedy JSON block extractor: matches from first { to last }
+# Used to pull agent protocol objects out of model output that contains
+# preamble prose, markdown code fences, or pretty-printed JSON.
+_JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
+
+
 def _parse_agent_response(text: str) -> Optional[dict]:
     """
-    Parse a single-line JSON agent response.
+    Parse an agent JSON response from anywhere in the model output.
 
-    The model is instructed to output exactly one JSON object per iteration:
+    The model is instructed to emit one of:
       {"action": {"tool": "...", "input": "..."}}
       {"finish": {"answer": "..."}}
       {"reflect": {"quality": "...", "issue": "...", "next": "..."}}
 
-    Scans the full text for the first valid JSON object so that minor preamble
-    or whitespace from the model does not break parsing.  Returns None if no
-    valid agent JSON is found.
+    Small local models (gemma3:1b etc.) frequently:
+      - Add preamble prose before the JSON
+      - Pretty-print the JSON across multiple lines
+      - Wrap it in ```json ... ``` fences
+
+    Strategy (in order):
+      1. Line scan — handles single-line JSON with or without preamble
+      2. Greedy block extraction — handles pretty-printed / fenced JSON
+         anywhere in the text
     """
-    # Try each line; the model should emit exactly one JSON line.
+    # 1. Line scan: fast path for well-behaved single-line output
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -72,11 +84,12 @@ def _parse_agent_response(text: str) -> Optional[dict]:
         except json.JSONDecodeError:
             continue
 
-    # Fallback: try the whole text stripped (model sometimes adds newlines inside JSON)
-    stripped = text.strip()
-    if stripped.startswith("{"):
+    # 2. Greedy block extraction: find the outermost { ... } span and parse it.
+    # This handles pretty-printed JSON and prose-prefixed output.
+    match = _JSON_BLOCK_RE.search(text)
+    if match:
         try:
-            obj = json.loads(stripped)
+            obj = json.loads(match.group())
             if isinstance(obj, dict) and any(k in obj for k in ("action", "finish", "reflect")):
                 return obj
         except json.JSONDecodeError:
@@ -191,7 +204,11 @@ class AgentLoop:
         _call_cache: dict[tuple[str, str], str] = {}
 
         # ── Main loop ──────────────────────────────────────────────────
-        for iteration in range(MAX_ITERATIONS):
+        # Chat turns should finish in 1 iteration — the prompt tells the model
+        # to answer directly. Capping at 1 prevents wasted LLM calls when the
+        # model outputs prose that the parser rescues via greedy extraction.
+        _max_iter = 1 if intent == Intent.CHAT else MAX_ITERATIONS
+        for iteration in range(_max_iter):
             trace.iterations_used = iteration + 1
 
             failure_hint = ""
@@ -217,10 +234,23 @@ class AgentLoop:
             logger.info(f"[agent.loop] iter={iteration + 1} LLM: {llm_ms}ms")
             thought = "".join(thought_chunks)
 
-            # Stream sanitized reasoning text to UI before parsing
+            # Stream sanitized reasoning text to UI before parsing.
+            # When the model emits only a JSON action with no human-readable preamble,
+            # thinking_display is empty after stripping. We still need to emit something
+            # so the ThinkingBlock has content (otherwise it shows an empty spinner).
             thinking_display = sanitize_thought_for_display(thought)
-            if thinking_display and len(thinking_display) >= AGENT_THINKING_MIN_CHARS:
-                yield StreamChunk(text=f"*{thinking_display}*\n\n", done=False)
+            if not thinking_display or len(thinking_display) < AGENT_THINKING_MIN_CHARS:
+                # Derive a minimal label from the parsed action/intent rather than
+                # silently emitting nothing — gives the user some feedback.
+                if intent == Intent.CHAT:
+                    thinking_display = "Thinking\u2026"
+                elif "action" in thought:
+                    thinking_display = "Deciding next action\u2026"
+                elif "finish" in thought:
+                    thinking_display = "Composing answer\u2026"
+                else:
+                    thinking_display = "Processing\u2026"
+            yield StreamChunk(text=f"*{thinking_display}*\n\n", done=False)
 
             logger.debug(f"[agent.loop] iter={iteration + 1} thought={thought[:120]}…")
 
@@ -244,20 +274,18 @@ class AgentLoop:
                     reflection=reflection_text,
                 ))
 
-                yield StreamChunk(text="\n### Reasoning\n", done=False)
-                status_map = {
-                    "good":    "✓ Task completed successfully.",
-                    "partial": "↻ Partial progress — continuing…",
-                    "failed":  "✗ Previous approach failed — trying alternative.",
-                }
-                yield StreamChunk(
-                    text=status_map.get(quality, f"Status: {quality}") + "\n",
-                    done=False,
-                )
-                if issue:
-                    yield StreamChunk(text=f"**Problem:** {issue}\n", done=False)
-                if next_step:
-                    yield StreamChunk(text=f"**Next:** {next_step}\n", done=False)
+                # Chat turns: reflect output is internal only — never shown to user.
+                # Tool agent turns: emit a minimal status line only (no raw fields).
+                if intent != Intent.CHAT:
+                    status_map = {
+                        "good":    "✓ Done.",
+                        "partial": "↻ Continuing…",
+                        "failed":  "✗ Retrying…",
+                    }
+                    yield StreamChunk(
+                        text=f"*{status_map.get(quality, '')}*\n" if quality in status_map else "",
+                        done=False,
+                    )
                 continue
 
             # ── finish ────────────────────────────────────────────────

@@ -479,11 +479,16 @@ class Engine:
             active_adapter = self._adapter_for(effective_intent)
             cw = active_adapter.context_window
 
-            # Build file content block — cap to 55% of context window
-            file_char_budget = round(cw * 0.55) * 4  # ~4 chars/token
+            # Build file content block.
+            # Hard cap at 6000 tokens (~24000 chars) regardless of context window —
+            # small local models (gemma3:1b) hang or time out processing large contexts
+            # even when the window technically fits. Beyond ~6k tokens the model's
+            # attention degrades and generation stalls.
+            MAX_FILE_TOKENS = 6000
+            file_char_budget = min(round(cw * 0.40) * 4, MAX_FILE_TOKENS * 4)
             all_chunks = "\n\n---\n\n".join(file_attachment.chunks)
             if len(all_chunks) > file_char_budget:
-                all_chunks = all_chunks[:file_char_budget] + "\n\n[... truncated]"
+                all_chunks = all_chunks[:file_char_budget] + "\n\n[... content truncated for performance]"
 
             _file_system = (
                 "You are LocalMind. A file has been uploaded. Read it carefully and respond to the user's request.\n"
@@ -495,9 +500,10 @@ class Engine:
                 {"role": "user",   "content": message},
             ]
 
-            # Use the chat adapter with proper parameters
+            # Pass intent so the per-intent timeout (OLLAMA_TIMEOUT_FILE_TASK) is used.
+            # Without intent=, the adapter falls back to the default 120s client timeout.
             full_response: list[str] = []
-            async for chunk in active_adapter.chat(_file_messages, temperature=0.0):
+            async for chunk in active_adapter.chat(_file_messages, temperature=0.0, intent="file_task"):
                 safe = _filter_system_leaks(chunk.text)
                 full_response.append(safe)
                 yield StreamChunk(text=safe, done=chunk.done)
@@ -559,10 +565,19 @@ class Engine:
             full_response_chunks.append(_preamble)
             yield StreamChunk(text=_preamble, done=False)
 
-        if effective_intent in AGENT_INTENTS:
-            _obs.emit("agent_loop_start", intent=effective_intent.value)
-            label = _TOOL_LABELS.get(effective_intent, effective_intent.value)
-            _obs.emit("tool_status", tool=effective_intent.value, label=label, status="running")
+        if effective_intent in AGENT_INTENTS or effective_intent == Intent.CHAT:
+            # CHAT is included here so it goes through the same loop mechanics
+            # (think → finish) and the ThinkingBlock renders in the UI.
+            # The agent system prompt for CHAT tells the model to finish directly
+            # without calling tools — so it's one LLM call, same as before, but
+            # now with visible reasoning and a consistent code path.
+            if effective_intent == Intent.CHAT:
+                # No tool_status obs for chat — it's not a tool operation
+                pass
+            else:
+                _obs.emit("agent_loop_start", intent=effective_intent.value)
+                label = _TOOL_LABELS.get(effective_intent, effective_intent.value)
+                _obs.emit("tool_status", tool=effective_intent.value, label=label, status="running")
             async for chunk in self._agent_loop.run(
                 messages=prompt_messages,
                 intent=effective_intent,
@@ -572,11 +587,6 @@ class Engine:
                 adapter=active_adapter,
                 intent_history=intent_history,
             ):
-                safe_text = _filter_system_leaks(chunk.text)
-                full_response_chunks.append(safe_text)
-                yield StreamChunk(text=safe_text, done=chunk.done)
-        else:
-            async for chunk in active_adapter.chat(prompt_messages, intent=effective_intent.value):
                 safe_text = _filter_system_leaks(chunk.text)
                 full_response_chunks.append(safe_text)
                 yield StreamChunk(text=safe_text, done=chunk.done)

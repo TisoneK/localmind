@@ -1,18 +1,22 @@
 """
-Chat endpoint — v0.3
+Chat endpoint — v0.4
 
 POST /api/chat — multipart/form-data with message + optional file.
-Streams SSE. Interleaves observability events between text chunks.
+Streams SSE.
 
-SSE payload types emitted in order:
+Title generation (two-stage):
+  - Stage 1 (sync): heuristic placeholder written immediately on first turn
+  - Stage 2 (async): LLM-generated title written ~2s later as background task
+
+SSE payload types:
     {"obs_event": {"type": "intent_classified", "data": {...}}}
-    {"intent": "web_search", "confidence": 0.92}   ← convenience extract
+    {"intent": "web_search", "confidence": 0.92}
     {"text": "Hello", "done": false}
-    ...
-    {"text": "", "done": true, "file_path": "/path/if/written", "file_name": "foo.py"}
+    {"text": "", "done": true, "file_path": "...", "file_name": "..."}
     {"obs_event": {"type": "turn_complete", "data": {...}}}
 """
 from __future__ import annotations
+import asyncio
 import json
 import uuid
 import logging
@@ -21,12 +25,11 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import Optional
-from contextlib import asynccontextmanager
 
 from core.engine import Engine
 from core.obs import ObsCollector
 from core.config import settings
-from core.title_generator import generate_title_smart, should_generate_title, refine_title_async
+from core.title_generator import generate_title_smart, refine_title_async
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -39,21 +42,43 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _is_first_turn(session_id: str) -> bool:
+    """True if the session has no messages yet (this is the opening turn)."""
+    try:
+        from storage.db import SessionStore
+        store = SessionStore(settings.localmind_db_path)
+        title = store.get_session_title(session_id)
+        # A session with no title hasn't had its first turn processed yet
+        return title is None
+    except Exception:
+        return False
+
+
 async def _event_stream(
     message: str,
     session_id: str,
+    is_first: bool,
     file_bytes=None,
     filename=None,
     content_type=None,
-    file_full_path=None,   # full path sent by UI if available
-    original_path=None,    # original file location
+    original_path=None,
     disconnect=None,
 ):
     obs = ObsCollector()
-    intent_emitted = False
     file_path_written = None
     file_name_written = None
-    captured_intent = None
+
+    # ── Stage 1: write heuristic placeholder title immediately ────────────
+    # This ensures the sidebar shows something before the LLM title arrives.
+    if is_first:
+        try:
+            from storage.db import SessionStore
+            store = SessionStore(settings.localmind_db_path)
+            placeholder = generate_title_smart(message)
+            store.update_session_title(session_id, placeholder)
+            logger.info(f"[title] placeholder '{placeholder}' for {session_id[:8]}")
+        except Exception as exc:
+            logger.warning(f"[title] placeholder write failed: {exc}")
 
     try:
         async for chunk in _engine.process(
@@ -65,68 +90,32 @@ async def _event_stream(
             obs=obs,
             original_path=original_path,
         ):
-            # Check if client disconnected
             if disconnect and await disconnect():
-                logger.info(f"Client disconnected, stopping stream for session {session_id}")
+                logger.info(f"Client disconnected for session {session_id}")
                 break
-            # Flush any buffered obs events before each text chunk
+
+            # Flush buffered obs events before each text chunk
             for evt in obs.drain():
                 yield _sse(evt.to_sse_dict())
-                if evt.type == "intent_classified" and not intent_emitted:
-                    intent_emitted = True
-                    captured_intent = evt.data.get("primary")
-                    
-                    # Update title with intent-aware generation
-                    try:
-                        from storage.db import SessionStore
-                        store = SessionStore(settings.localmind_db_path)
-                        current_title = store.get_session_title(session_id)
-                        
-                        # Always update if we have a better smart title
-                        smart_title = generate_title_smart(message, captured_intent)
-                        
-                        # Only update if different or if current title looks like truncation
-                        should_update = (
-                            not current_title or 
-                            current_title == "New Chat" or
-                            len(current_title) > 35 or  # Likely truncated
-                            current_title.endswith("...") or  # Truncated
-                            current_title != smart_title
-                        )
-                        
-                        if should_update:
-                            store.update_session_title(session_id, smart_title)
-                            logger.info(f"INTENT-AWARE UPDATE: {captured_intent} -> '{smart_title}' (replaced: '{current_title}')")
-                    except Exception as e:
-                        logger.warning(f"Failed to update title with intent: {e}")
-                    
+                if evt.type == "intent_classified":
                     yield _sse({
-                        "intent": evt.data.get("primary"),
+                        "intent":     evt.data.get("primary"),
                         "confidence": float(evt.data.get("confidence", 0.5)),
                     })
-                if evt.type == 'tool_dispatched' and not intent_emitted:
-                    intent_emitted = True
 
-            # Process each chunk and capture observability events
-            if hasattr(chunk, 'metadata') and chunk.metadata:
-                # Chunk contains observability data from agent
-                obs_evt = chunk.metadata.get('obs_event')
+            if hasattr(chunk, "metadata") and chunk.metadata:
+                obs_evt = chunk.metadata.get("obs_event")
                 if obs_evt:
                     yield _sse(obs_evt.to_sse_dict())
+                if "path" in chunk.metadata:
+                    file_path_written = chunk.metadata["path"]
+                    file_name_written = chunk.metadata.get("filename")
 
             if chunk.error:
-                # Render the error text to the user before closing the stream.
-                # Error chunks carry a user-facing message in chunk.text.
                 if chunk.text:
                     yield _sse({"text": chunk.text, "done": False})
                 yield _sse({"error": chunk.error, "done": True})
                 return
-
-            # Capture file path from tool result metadata streamed in chunk
-            if hasattr(chunk, "metadata") and chunk.metadata:
-                if "path" in chunk.metadata:
-                    file_path_written = chunk.metadata["path"]
-                    file_name_written = chunk.metadata.get("filename")
 
             if chunk.done:
                 done_payload: dict = {"text": "", "done": True}
@@ -135,39 +124,21 @@ async def _event_stream(
                     done_payload["file_name"] = file_name_written or Path(file_path_written).name
                 yield _sse(done_payload)
             elif chunk.text:
-                logger.debug(f"[chat] yielding text chunk: '{chunk.text}' (done=False)")
                 yield _sse({"text": chunk.text, "done": False})
 
-        # Final obs flush (turn_complete lands here)
+        # Final obs flush
         for evt in obs.drain():
             yield _sse(evt.to_sse_dict())
 
-        # Fallback: If no intent was classified, still generate smart title
-        if not intent_emitted:
-            try:
-                from storage.db import SessionStore
-                store = SessionStore(settings.localmind_db_path)
-                current_title = store.get_session_title(session_id)
-                
-                should_update = (
-                    not current_title or 
-                    current_title == "New Chat" or
-                    len(current_title) > 35 or
-                    current_title.endswith("...")
-                )
-                
-                if should_update:
-                    smart_title = generate_title_smart(message, None)  # No intent available
-                    store.update_session_title(session_id, smart_title)
-                    logger.info(f"FALLBACK TITLE UPDATE: '{smart_title}' (replaced: '{current_title}')")
-            except Exception as e:
-                logger.error(f"Stream error: {e}", exc_info=True)
-                yield _sse({"error": str(e), "done": True})
+    except Exception as exc:
+        logger.error(f"[chat] stream error: {exc}", exc_info=True)
+        yield _sse({"error": str(exc), "done": True})
 
-    except Exception as e:
-        logger.error(f"Stream error: {e}", exc_info=True)
-        yield _sse({"error": str(e), "done": True})
-        yield _sse({"type": "stream_closed", "done": True})  # Ensure proper stream closure
+    # ── Stage 2: schedule LLM title as background task ────────────────────
+    # Fires after the response stream completes so it never blocks the user.
+    if is_first:
+        asyncio.create_task(refine_title_async(session_id, message))
+        logger.info(f"[title] LLM refinement scheduled for {session_id[:8]}")
 
 
 @router.post("/chat")
@@ -176,18 +147,12 @@ async def chat(
     message: str = Form(...),
     session_id: str = Form(default=None),
     file: Optional[UploadFile] = File(default=None),
-    file_full_path: Optional[str] = Form(default=None),  # full path from UI
-    original_path: Optional[str] = Form(default=None),  # original file location
+    file_full_path: Optional[str] = Form(default=None),
+    original_path: Optional[str] = Form(default=None),
 ):
     """Stream a chat response as Server-Sent Events."""
-    logger.info(f"Chat request: message='{message}', session_id='{session_id}'")
-    logger.info(f"File received: {file is not None}, filename: {file.filename if file else 'None'}")
-    logger.info(f"File full path: {file_full_path}")
-    
     sid = session_id or str(uuid.uuid4())
-
-    # 🔥 Title generation will happen during intent classification in the event stream
-    # This ensures we have access to the detected intent for smart title generation
+    is_first = _is_first_turn(sid)
 
     file_bytes = None
     filename = None
@@ -201,36 +166,31 @@ async def chat(
                     status_code=413,
                     detail=f"File too large. Maximum {settings.localmind_max_file_size_mb} MB.",
                 )
-            # Save uploaded file to uploads dir
             uploads_dir = Path(settings.localmind_uploads_path)
             uploads_dir.mkdir(parents=True, exist_ok=True)
             dest = uploads_dir / file.filename
             dest.write_bytes(file_bytes)
             filename = file.filename
             file_content_type = file.content_type or "application/octet-stream"
-            # Use client-provided full path if given, otherwise use uploads dir path
             if not file_full_path:
                 file_full_path = str(dest)
-            logger.info(f"[chat] File uploaded successfully: {filename}, {len(file_bytes)} bytes")
-        except Exception as e:
-            logger.error(f"[chat] File upload error: {e}", exc_info=True)
-            # Return error as SSE instead of breaking the stream
-            async def error_stream():
-                yield _sse({"error": f"File upload failed: {e}", "done": True})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"[chat] file upload error: {exc}", exc_info=True)
+            async def _err():
+                yield _sse({"error": f"File upload failed: {exc}", "done": True})
             return StreamingResponse(
-                error_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                    "X-Session-ID": sid,
-                },
+                _err(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
     return StreamingResponse(
         _event_stream(
-            message, sid, file_bytes, filename, file_content_type, file_full_path, original_path,
-            disconnect=request.is_disconnected
+            message, sid, is_first,
+            file_bytes, filename, file_content_type,
+            original_path or file_full_path,
+            disconnect=request.is_disconnected,
         ),
         media_type="text/event-stream",
         headers={

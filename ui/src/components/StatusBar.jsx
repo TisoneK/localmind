@@ -1,67 +1,94 @@
+const C = {
+  bg:       '#08080d',
+  border:   '#1a1a28',
+  accent:   '#7c6af7',
+  green:    '#3ecf8e',
+  red:      '#f87171',
+  muted:    '#55558a',
+  faint:    '#35354a',
+  codeFont: '"JetBrains Mono", "Fira Code", monospace',
+}
+
 const S = {
   bar: {
     display: 'flex',
     alignItems: 'center',
-    gap: '12px',
+    gap: '10px',
     padding: '0 16px',
-    height: '36px',
-    background: '#0a0a10',
-    borderBottom: '1px solid #1a1a26',
+    height: '38px',
+    background: C.bg,
+    borderBottom: `1px solid ${C.border}`,
     fontSize: '12px',
-    color: '#55556a',
+    color: C.muted,
+    flexShrink: 0,
+    userSelect: 'none',
+  },
+  statusDot: (ok) => ({
+    width: '7px',
+    height: '7px',
+    borderRadius: '50%',
+    background: ok ? C.green : C.red,
+    flexShrink: 0,
+    boxShadow: ok ? `0 0 6px ${C.green}60` : `0 0 6px ${C.red}60`,
+  }),
+  model: {
+    color: C.accent,
+    fontFamily: C.codeFont,
+    fontSize: '10.5px',
+    background: '#12122a',
+    padding: '2px 7px',
+    borderRadius: '5px',
+    border: `1px solid #2a2a50`,
+  },
+  sep: {
+    width: '1px',
+    height: '14px',
+    background: C.border,
     flexShrink: 0,
   },
-  dot: (ok) => ({
-    width: '6px',
-    height: '6px',
-    borderRadius: '50%',
-    background: ok ? '#22c55e' : '#ef4444',
-    flexShrink: 0,
-  }),
-  label: { color: '#9090a8' },
-  model: {
-    color: '#6366f1',
-    fontFamily: 'monospace',
-    fontSize: '11px',
+  session: {
+    fontSize: '10.5px',
+    color: C.faint,
+    fontFamily: C.codeFont,
+    maxWidth: '120px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
   },
   spacer: { flex: 1 },
   newBtn: {
-    background: '#22c55e',
-    border: '1px solid #22c55e',
-    borderRadius: '6px',
-    color: '#ffffff',
+    background: 'transparent',
+    border: `1px solid #2a2a50`,
+    borderRadius: '7px',
+    color: C.accent,
     fontSize: '11px',
-    padding: '3px 8px',
+    padding: '4px 10px',
     cursor: 'pointer',
-    fontWeight: '500',
+    fontFamily: 'inherit',
+    letterSpacing: '0.01em',
+    transition: 'all 0.15s',
   },
 }
 
-/**
- * StatusBar receives health + sessionTitle as props from App.
- * It no longer owns hook instances — App is the single source of truth.
- */
 export function StatusBar({ onNewChat, sessionId, health, sessionTitle }) {
-  const ok = health?.ollama_reachable === true
-  const model = health?.model || '---'
-  const status = health == null ? 'connecting...' : ok ? 'connected' : 'Ollama offline'
-
-  const displayTitle = sessionTitle || (sessionId ? `#${sessionId.slice(0, 8)}` : null)
+  const ok      = health?.ollama_reachable === true
+  const model   = health?.model || '---'
+  const status  = health == null ? 'connecting' : ok ? 'connected' : 'offline'
+  const display = sessionTitle || (sessionId ? sessionId.slice(0, 8) : null)
 
   return (
     <div style={S.bar}>
-      <div style={S.dot(ok)} />
-      <span style={S.label}>{status}</span>
+      <div style={S.statusDot(ok)} />
+      <span>{status}</span>
       {ok && <span style={S.model}>{model}</span>}
       <div style={S.spacer} />
-      {displayTitle && (
-        <span title={`Session: ${sessionId}`}>
-          {displayTitle}
-        </span>
+      {display && (
+        <>
+          <div style={S.sep} />
+          <span style={S.session} title={`Session: ${sessionId}`}>{display}</span>
+        </>
       )}
-      <button style={S.newBtn} onClick={onNewChat} title="Start a new conversation">
-        + New chat
-      </button>
+      <button style={S.newBtn} onClick={onNewChat}>+ new chat</button>
     </div>
   )
 }
