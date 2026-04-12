@@ -78,6 +78,11 @@ class ToolResult(BaseModel):
     source: str
     metadata: dict = Field(default_factory=dict)
     requires_confirmation: bool = False
+    # Structured error contract.  Defaults preserve backward compatibility
+    # with tools that don't populate these fields.
+    success: bool = True
+    error_type: str = ""
+    error_message: str = ""
 
 
 class EngineContext(BaseModel):

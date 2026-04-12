@@ -50,6 +50,9 @@ async def code_exec(message: str) -> ToolResult:
             content="No executable Python code found in the message. Please provide code in a ```python``` block.",
             risk=RiskLevel.LOW,
             source="code_exec",
+            success=False,
+            error_type="invalid_input",
+            error_message="No fenced ```python``` block found in input.",
         )
 
     timeout = getattr(settings, "localmind_code_exec_timeout", 30)
@@ -60,6 +63,9 @@ async def code_exec(message: str) -> ToolResult:
             content="Code execution is disabled. Set LOCALMIND_CODE_EXEC_ENABLED=true to enable.",
             risk=RiskLevel.LOW,
             source="code_exec",
+            success=False,
+            error_type="permission",
+            error_message="Code execution disabled via LOCALMIND_CODE_EXEC_ENABLED.",
         )
 
     # Write code to a temp string and run it as a subprocess
@@ -80,6 +86,9 @@ async def code_exec(message: str) -> ToolResult:
                 risk=RiskLevel.MEDIUM,
                 source="code_exec",
                 metadata={"exit_code": -1, "timed_out": True},
+                success=False,
+                error_type="timeout",
+                error_message=f"Subprocess killed after {timeout}s timeout.",
             )
 
         out = stdout.decode("utf-8", errors="replace")
@@ -114,6 +123,9 @@ async def code_exec(message: str) -> ToolResult:
             content=f"Execution failed: {e}",
             risk=RiskLevel.HIGH,
             source="code_exec",
+            success=False,
+            error_type="internal_error",
+            error_message=str(e),
         )
 
 

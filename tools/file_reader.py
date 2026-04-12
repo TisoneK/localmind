@@ -294,6 +294,9 @@ async def file_task(message: str, original_path: str = None) -> ToolResult:
                     content=f"Could not read {p}: {e}",
                     risk=RiskLevel.LOW,
                     source="file_reader",
+                    success=False,
+                    error_type="internal_error",
+                    error_message=str(e),
                 )
 
     return ToolResult(
@@ -304,6 +307,9 @@ async def file_task(message: str, original_path: str = None) -> ToolResult:
         ),
         risk=RiskLevel.LOW,
         source="file_reader",
+        success=False,
+        error_type="not_found",
+        error_message="No readable file path found in message or upload context.",
     )
 
 

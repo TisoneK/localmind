@@ -18,6 +18,7 @@ v0.5 changes vs v0.4 (monolithic agent.py):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -44,15 +45,44 @@ from core.agent.tool_dispatch import dispatch_with_retry
 
 logger = logging.getLogger(__name__)
 
-# ── Regex patterns ─────────────────────────────────────────────────────────────
+# ── JSON parsing helpers ───────────────────────────────────────────────────────
 
-_ACTION_PATTERN = re.compile(
-    r"<action>\s*tool:\s*(\w+)\s*input:\s*(.*?)\s*</action>",
-    re.DOTALL | re.IGNORECASE,
-)
-_FINISH_PATTERN = re.compile(r"<finish>(.*?)</finish>", re.DOTALL | re.IGNORECASE)
-_REFLECT_PATTERN = re.compile(r"<reflect>(.*?)</reflect>", re.DOTALL | re.IGNORECASE)
-_CLARIFY_PATTERN = re.compile(r"<clarify>(.*?)</clarify>", re.DOTALL | re.IGNORECASE)
+def _parse_agent_response(text: str) -> Optional[dict]:
+    """
+    Parse a single-line JSON agent response.
+
+    The model is instructed to output exactly one JSON object per iteration:
+      {"action": {"tool": "...", "input": "..."}}
+      {"finish": {"answer": "..."}}
+      {"reflect": {"quality": "...", "issue": "...", "next": "..."}}
+
+    Scans the full text for the first valid JSON object so that minor preamble
+    or whitespace from the model does not break parsing.  Returns None if no
+    valid agent JSON is found.
+    """
+    # Try each line; the model should emit exactly one JSON line.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and any(k in obj for k in ("action", "finish", "reflect")):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    # Fallback: try the whole text stripped (model sometimes adds newlines inside JSON)
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict) and any(k in obj for k in ("action", "finish", "reflect")):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -101,6 +131,10 @@ class AgentLoop:
         # each iteration to wait the full ollama_timeout (default 120s) before
         # failing.  A 5-second health probe here converts a 300s+ hang into an
         # immediate, actionable error message.
+        # Warmup first to ensure model is loaded, then health check
+        if hasattr(active_adapter, "warmup"):
+            await active_adapter.warmup()
+            
         if hasattr(active_adapter, "health_check"):
             try:
                 reachable = await active_adapter.health_check()
@@ -151,6 +185,11 @@ class AgentLoop:
                 f"{_truncate_observation(safe_initial)}\n"
             )
 
+        # Per-turn tool call cache: (tool_name, normalised_input) → observation text.
+        # Used for deduplication — if the model re-emits an identical action we
+        # return the cached result immediately rather than re-dispatching.
+        _call_cache: dict[tuple[str, str], str] = {}
+
         # ── Main loop ──────────────────────────────────────────────────
         for iteration in range(MAX_ITERATIONS):
             trace.iterations_used = iteration + 1
@@ -165,11 +204,11 @@ class AgentLoop:
             context_msg = (
                 f"{observation_log}{failure_hint}\n"
                 f"Iteration {iteration + 1}/{MAX_ITERATIONS}. "
-                f"Think, reflect if needed, then act or finish."
+                f"Output one JSON object: action, finish, or reflect."
             )
             iteration_messages = loop_messages + [{"role": "user", "content": context_msg}]
 
-            # ── LLM call — collect full thought ───────────────────────
+            # ── LLM call — collect full response ──────────────────────
             thought_chunks: list[str] = []
             t_llm = time.monotonic()
             async for chunk in active_adapter.chat(iteration_messages, temperature=0.3):
@@ -178,60 +217,27 @@ class AgentLoop:
             logger.info(f"[agent.loop] iter={iteration + 1} LLM: {llm_ms}ms")
             thought = "".join(thought_chunks)
 
-            # Stream sanitized reasoning text to UI
+            # Stream sanitized reasoning text to UI before parsing
             thinking_display = sanitize_thought_for_display(thought)
             if thinking_display and len(thinking_display) >= AGENT_THINKING_MIN_CHARS:
                 yield StreamChunk(text=f"*{thinking_display}*\n\n", done=False)
 
             logger.debug(f"[agent.loop] iter={iteration + 1} thought={thought[:120]}…")
 
-            # ── <clarify> ──────────────────────────────────────────────
-            clarify_match = _CLARIFY_PATTERN.search(thought)
-            if clarify_match:
-                question = clarify_match.group(1).strip()
-                trace.clarification_issued = True
-                trace.steps.append(AgentStep(
-                    iteration=iteration + 1, thought=thought,
-                    tool_name=None, tool_input=None, observation=None,
-                    reflection="clarification issued",
-                ))
-                yield StreamChunk(text=question, done=False)
-                yield StreamChunk(text="", done=True)
-                return
+            # ── Parse structured JSON response ─────────────────────────
+            parsed = _parse_agent_response(thought)
 
-            # ── <finish> ───────────────────────────────────────────────
-            finish_match = _FINISH_PATTERN.search(thought)
-            if finish_match:
-                final_response = _filter_system_leaks(finish_match.group(1).strip())
-                trace.final_response = final_response
-                trace.steps.append(AgentStep(
-                    iteration=iteration + 1, thought=thought,
-                    tool_name=None, tool_input=None, observation=None,
-                ))
-                yield StreamChunk(text=final_response, done=False)
-                yield StreamChunk(text="", done=True)
-                logger.info(f"[agent.loop] finished iter={iteration + 1} — {trace.summary()}")
-                return
+            # ── reflect ───────────────────────────────────────────────
+            if parsed and "reflect" in parsed:
+                ref = parsed["reflect"] if isinstance(parsed["reflect"], dict) else {}
+                quality = str(ref.get("quality", "unknown")).lower()
+                issue   = str(ref.get("issue", ""))
+                next_step = str(ref.get("next", ""))
+                reflection_text = f"quality: {quality}\nissue: {issue}\nnext: {next_step}"
 
-            # ── <reflect> ─────────────────────────────────────────────
-            reflect_match = _REFLECT_PATTERN.search(thought)
-            if reflect_match:
-                reflection_text = reflect_match.group(1).strip()
                 observation_log += f"\n[Reflection]\n{reflection_text}\n"
-
-                quality = "unknown"
-                issue = ""
-                next_step = ""
-                for line in reflection_text.splitlines():
-                    lower = line.strip().lower()
-                    if lower.startswith("quality:"):
-                        quality = lower.split(":", 1)[1].strip()
-                    elif lower.startswith("issue:"):
-                        issue = line.split(":", 1)[1].strip()
-                    elif lower.startswith("next:"):
-                        next_step = line.split(":", 1)[1].strip()
-
                 last_tool_failed = quality == "failed"
+
                 trace.steps.append(AgentStep(
                     iteration=iteration + 1, thought=thought,
                     tool_name=None, tool_input=None, observation=None,
@@ -240,9 +246,9 @@ class AgentLoop:
 
                 yield StreamChunk(text="\n### Reasoning\n", done=False)
                 status_map = {
-                    "good": "✓ Task completed successfully.",
+                    "good":    "✓ Task completed successfully.",
                     "partial": "↻ Partial progress — continuing…",
-                    "failed": "✗ Previous approach failed — trying alternative.",
+                    "failed":  "✗ Previous approach failed — trying alternative.",
                 }
                 yield StreamChunk(
                     text=status_map.get(quality, f"Status: {quality}") + "\n",
@@ -254,33 +260,191 @@ class AgentLoop:
                     yield StreamChunk(text=f"**Next:** {next_step}\n", done=False)
                 continue
 
-            # ── <action> ──────────────────────────────────────────────
-            action_match = _ACTION_PATTERN.search(thought)
-            if action_match:
-                async for chunk in self._handle_action(
-                    action_match=action_match,
-                    thought=thought,
-                    iteration=iteration,
-                    observation_log=observation_log,
-                    trace=trace,
-                    last_tool_failed_ref=[last_tool_failed],
-                    consecutive_failures_ref=[consecutive_failures],
-                ):
-                    # _handle_action signals "early return" via a sentinel done=True chunk
-                    # with a special marker; check here.
-                    if chunk.done and chunk.error == "__RETURN__":
-                        return
-                    # Update mutable refs back
-                    yield chunk
+            # ── finish ────────────────────────────────────────────────
+            if parsed and "finish" in parsed:
+                fin = parsed["finish"] if isinstance(parsed["finish"], dict) else {}
+                final_response = _filter_system_leaks(str(fin.get("answer", "")).strip())
+                trace.final_response = final_response
+                trace.steps.append(AgentStep(
+                    iteration=iteration + 1, thought=thought,
+                    tool_name=None, tool_input=None, observation=None,
+                ))
+                yield StreamChunk(text=final_response, done=False)
+                yield StreamChunk(text="", done=True)
+                logger.info(f"[agent.loop] finished iter={iteration + 1} — {trace.summary()}")
+                return
 
-                # Refresh mutable state from refs (Python lists used as pass-by-ref)
-                last_tool_failed = self._last_tool_failed
-                consecutive_failures = self._consecutive_failures
-                observation_log = self._observation_log
+            # ── action ────────────────────────────────────────────────
+            if parsed and "action" in parsed:
+                act = parsed["action"] if isinstance(parsed["action"], dict) else {}
+                tool_name  = str(act.get("tool", "")).strip()
+                tool_input = str(act.get("input", "")).strip()
+
+                # Semantic validation: reject empty or degenerate inputs before dispatch.
+                # A structurally valid JSON action with a useless input (empty string,
+                # pure punctuation, fewer than 3 chars) is guaranteed to produce a bad
+                # tool result and wastes an Ollama call.  Feed back a clear error so the
+                # model can correct itself rather than silently dispatching garbage.
+                if not tool_input or len(tool_input.strip("?. \t")) < 3:
+                    observation = (
+                        f"[Action rejected: input for '{tool_name}' is empty or too short. "
+                        f"Provide a specific, meaningful input and try again.]"
+                    )
+                    logger.warning(
+                        f"[agent.loop] rejected degenerate input for tool={tool_name!r}: {tool_input!r}"
+                    )
+                    last_tool_failed = True
+                    consecutive_failures += 1
+                    observation_log += f"\n[Tool: {tool_name} | Status: REJECTED (bad input)]\n{observation}\n"
+                    trace.steps.append(AgentStep(
+                        iteration=iteration + 1, thought=thought,
+                        tool_name=tool_name, tool_input=tool_input,
+                        observation=observation, tool_failed=True,
+                        retry_count=0, latency_ms=0,
+                    ))
+                    continue
+
+                # Deduplication: skip a tool call we've already made this turn.
+                # The model sometimes re-emits an identical action when it loses
+                # track of what it has already observed.  Returning the cached
+                # result is cheaper and prevents infinite loops on slow models.
+                call_fingerprint = (tool_name, tool_input.lower().strip())
+                if call_fingerprint in _call_cache:
+                    cached_obs = _call_cache[call_fingerprint]
+                    logger.info(
+                        f"[agent.loop] dedup hit for tool={tool_name!r} — returning cached result"
+                    )
+                    observation_log += (
+                        f"\n[Tool: {tool_name} | Input: {tool_input[:60]} | Status: CACHED]\n"
+                        f"{_truncate_observation(cached_obs)}\n"
+                    )
+                    trace.steps.append(AgentStep(
+                        iteration=iteration + 1, thought=thought,
+                        tool_name=tool_name, tool_input=tool_input,
+                        observation=f"[cached] {cached_obs[:200]}",
+                        tool_failed=False, retry_count=0, latency_ms=0,
+                    ))
+                    continue
+
+                # Guard: reject tool names not in the explicit allowlist.
+                from core.agent.constants import AGENT_ALLOWED_TOOLS
+                if tool_name not in AGENT_ALLOWED_TOOLS:
+                    allowed_list = ", ".join(sorted(AGENT_ALLOWED_TOOLS))
+                    observation = (
+                        f"[Tool '{tool_name}' is not available. "
+                        f"Available tools: {allowed_list}]"
+                    )
+                    logger.warning(f"[agent.loop] rejected tool name: {tool_name!r}")
+                    last_tool_failed = True
+                    consecutive_failures += 1
+                    observation_log += (
+                        f"\n[Tool: {tool_name} | Status: BLOCKED (not in allowlist)]\n"
+                        f"{observation}\n"
+                    )
+                    trace.steps.append(AgentStep(
+                        iteration=iteration + 1, thought=thought,
+                        tool_name=tool_name, tool_input=tool_input,
+                        observation=observation, tool_failed=True,
+                        retry_count=0, latency_ms=0,
+                    ))
+                    continue
+
+                logger.info(f"[agent.loop] iter={iteration + 1} tool={tool_name} input={tool_input[:80]}")
+
+                yield StreamChunk(text=f"\n### Action: `{tool_name}`\n", done=False)
+                action_labels = {
+                    "file_write": f"Creating file: `{tool_input}`",
+                    "code_exec":  "Executing code…",
+                    "web_search": f"Searching: *{tool_input}*",
+                    "read_file":  f"Reading: `{tool_input}`",
+                }
+                yield StreamChunk(
+                    text=action_labels.get(tool_name, f"Input: {tool_input}") + "\n",
+                    done=False,
+                )
+
+                t_tool = time.monotonic()
+                tool_failed = False
+                retry_count = 0
+                observation = ""
+
+                try:
+                    tool_intent = Intent(tool_name)
+                    tool_result, tool_failed, retry_count = await dispatch_with_retry(
+                        tool_intent, tool_input
+                    )
+                    latency_ms = round((time.monotonic() - t_tool) * 1000)
+
+                    if tool_result:
+                        if tool_intent == Intent.CODE_EXEC:
+                            safe_obs = _filter_code_output(tool_result.content)
+                        else:
+                            safe_obs = _filter_tool_injection(tool_result.content)
+
+                        # Prepend structured error context so the LLM can reason
+                        # about *why* a tool failed rather than just seeing a message.
+                        if not tool_result.success and tool_result.error_type:
+                            safe_obs = (
+                                f"[Tool '{tool_name}' returned error_type={tool_result.error_type!r}]\n"
+                                + safe_obs
+                            )
+
+                        # Web-search: stream result immediately, write files in background.
+                        if tool_intent == Intent.WEB_SEARCH:
+                            async for chunk in self._handle_web_search_result(
+                                safe_obs=safe_obs,
+                                query=tool_input,
+                                thought=thought,
+                                iteration=iteration,
+                                trace=trace,
+                            ):
+                                yield chunk
+                            return  # web search is always terminal in agent loop
+
+                        observation = safe_obs
+                        _call_cache[call_fingerprint] = safe_obs  # store for deduplication
+                        last_tool_failed = False
+                        consecutive_failures = 0
+
+                        if retry_count > 0:
+                            yield StreamChunk(
+                                text=f"*(succeeded after {retry_count} retr{'y' if retry_count == 1 else 'ies'})*\n",
+                                done=False,
+                            )
+                    else:
+                        observation = f"[Tool '{tool_name}' returned no result after {retry_count} retries]"
+                        tool_failed = True
+                        latency_ms = round((time.monotonic() - t_tool) * 1000)
+
+                except (ValueError, Exception) as exc:
+                    observation = f"[Tool '{tool_name}' failed: {exc}]"
+                    tool_failed = True
+                    retry_count = 0
+                    latency_ms = round((time.monotonic() - t_tool) * 1000)
+
+                if tool_failed:
+                    last_tool_failed = True
+                    consecutive_failures += 1
+
+                trace.steps.append(AgentStep(
+                    iteration=iteration + 1,
+                    thought=thought,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    observation=observation[:500],
+                    tool_failed=tool_failed,
+                    retry_count=retry_count,
+                    latency_ms=latency_ms,
+                ))
+                observation_log += (
+                    f"\n[Tool: {tool_name} | Input: {tool_input[:60]} | "
+                    f"Status: {'FAILED' if tool_failed else 'OK'} | {latency_ms}ms]\n"
+                    f"{_truncate_observation(observation)}\n"
+                )
                 continue
 
-            # ── No tag found — treat whole thought as finish ───────────
-            logger.warning(f"[agent.loop] no structured tag at iter={iteration + 1}, treating as finish")
+            # ── No valid JSON — treat whole response as finish ─────────
+            logger.warning(f"[agent.loop] no structured JSON at iter={iteration + 1}, treating as finish")
             filtered = _filter_system_leaks(thought)
             yield StreamChunk(text=filtered, done=False)
             yield StreamChunk(text="", done=True)
@@ -295,163 +459,6 @@ class AgentLoop:
             active_adapter=active_adapter,
         ):
             yield chunk
-
-    # ------------------------------------------------------------------
-    # Action handler (extracted to keep run() readable)
-    # ------------------------------------------------------------------
-
-    async def _handle_action(
-        self,
-        action_match,
-        thought: str,
-        iteration: int,
-        observation_log: str,
-        trace: AgentTrace,
-        last_tool_failed_ref: list,
-        consecutive_failures_ref: list,
-    ) -> AsyncIterator[StreamChunk]:
-        """
-        Execute the tool requested in an <action> block and update the
-        observation log.  Yields StreamChunks; uses instance attrs as
-        "return values" for mutable state (last_tool_failed, consecutive_failures,
-        observation_log) since Python generators can't return values.
-        """
-        tool_name = action_match.group(1).strip()
-        tool_input = action_match.group(2).strip()
-        logger.info(f"[agent.loop] iter={iteration + 1} tool={tool_name} input={tool_input[:80]}")
-
-        # Guard: reject tool names not in the explicit allowlist.
-        # Prevents hallucinated tool names from reaching dispatch and producing
-        # confusing "not registered" errors.
-        from core.agent.constants import AGENT_ALLOWED_TOOLS
-        if tool_name not in AGENT_ALLOWED_TOOLS:
-            allowed_list = ", ".join(sorted(AGENT_ALLOWED_TOOLS))
-            observation = (
-                f"[Tool '{tool_name}' is not available. "
-                f"Available tools: {allowed_list}]"
-            )
-            logger.warning(f"[agent.loop] hallucinated tool name: {tool_name!r}")
-            self._last_tool_failed = True
-            self._consecutive_failures = consecutive_failures_ref[0] + 1
-            self._observation_log = (
-                observation_log
-                + f"\n[Tool: {tool_name} | Status: BLOCKED (not in allowlist)]\n"
-                f"{observation}\n"
-            )
-            trace.steps.append(AgentStep(
-                iteration=iteration + 1,
-                thought=thought,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                observation=observation,
-                tool_failed=True,
-                retry_count=0,
-                latency_ms=0,
-            ))
-            return
-
-        yield StreamChunk(text=f"\n### Action: `{tool_name}`\n", done=False)
-        action_labels = {
-            "file_write": f"Creating file: `{tool_input}`",
-            "code_exec": "Executing code…",
-            "web_search": f"Searching: *{tool_input}*",
-            "read_file": f"Reading: `{tool_input}`",
-        }
-        yield StreamChunk(
-            text=action_labels.get(tool_name, f"Input: {tool_input}") + "\n",
-            done=False,
-        )
-
-        t_tool = time.monotonic()
-        observation: str
-        tool_failed: bool
-        retry_count: int
-
-        try:
-            tool_intent = Intent(tool_name)
-            tool_result, tool_failed, retry_count = await dispatch_with_retry(
-                tool_intent, tool_input
-            )
-            latency_ms = round((time.monotonic() - t_tool) * 1000)
-            logger.info(f"[agent.loop] iter={iteration + 1} tool={tool_name}: {latency_ms}ms")
-
-            if tool_result:
-                # Filter prompt injection before re-entering context
-                if tool_intent == Intent.CODE_EXEC:
-                    safe_obs = _filter_code_output(tool_result.content)
-                else:
-                    safe_obs = _filter_tool_injection(tool_result.content)
-
-                # Web-search special path: write results + summary to files
-                if tool_intent == Intent.WEB_SEARCH:
-                    _ws_completed = False
-                    async for chunk in self._handle_web_search_result(
-                        safe_obs=safe_obs,
-                        query=tool_input,
-                        thought=thought,
-                        iteration=iteration,
-                        trace=trace,
-                    ):
-                        if chunk.done and not chunk.error:
-                            # This is _handle_web_search_result's internal completion
-                            # signal (done=True, error=None). It means the file write
-                            # confirmed. Suppress forwarding it -- we'll send __RETURN__
-                            # below instead. Do NOT yield this chunk or the caller loop
-                            # receives a done=True without __RETURN__ and stalls.
-                            _ws_completed = True
-                        else:
-                            yield chunk
-                    # File write confirmed: tell the caller loop to exit cleanly.
-                    # If _handle_web_search_result threw, it yields nothing, so
-                    # _ws_completed stays False and the agent loop continues normally.
-                    if _ws_completed:
-                        yield StreamChunk(text="", done=True, error="__RETURN__")
-                        return
-
-                observation = safe_obs
-                last_tool_failed_ref[0] = False
-                consecutive_failures_ref[0] = 0
-
-                if retry_count > 0:
-                    yield StreamChunk(
-                        text=f"*(succeeded after {retry_count} retr{'y' if retry_count == 1 else 'ies'})*\n",
-                        done=False,
-                    )
-            else:
-                observation = f"[Tool '{tool_name}' returned no result after {retry_count} retries]"
-                tool_failed = True
-                latency_ms = round((time.monotonic() - t_tool) * 1000)
-
-        except (ValueError, Exception) as exc:
-            observation = f"[Tool '{tool_name}' failed: {exc}]"
-            tool_failed = True
-            retry_count = 0
-            latency_ms = round((time.monotonic() - t_tool) * 1000)
-
-        if tool_failed:
-            last_tool_failed_ref[0] = True
-            consecutive_failures_ref[0] += 1
-
-        trace.steps.append(AgentStep(
-            iteration=iteration + 1,
-            thought=thought,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            observation=observation[:500],
-            tool_failed=tool_failed,
-            retry_count=retry_count,
-            latency_ms=latency_ms,
-        ))
-
-        # Persist mutable state back through instance attrs
-        self._last_tool_failed = last_tool_failed_ref[0]
-        self._consecutive_failures = consecutive_failures_ref[0]
-        self._observation_log = (
-            observation_log
-            + f"\n[Tool: {tool_name} | Input: {tool_input[:60]} | "
-            f"Status: {'FAILED' if tool_failed else 'OK'} | {latency_ms}ms]\n"
-            f"{_truncate_observation(observation)}\n"
-        )
 
     # ------------------------------------------------------------------
     # Web-search result handler
@@ -469,12 +476,8 @@ class AgentLoop:
         Stream search results to the user immediately, then write result files
         as a background task.
 
-        Previously this awaited two file-write tool calls before yielding
-        anything to the user — adding 2× FILE_OP_TIMEOUT latency to every
-        web search.  Now the user sees the preview instantly; file writes
-        happen concurrently and their filenames are included in the response
-        optimistically (they will be present by the time the user tries to
-        open them).
+        The caller is responsible for returning after iterating this method.
+        Web search is always terminal in the agent loop — the results are the answer.
         """
         filename = f"search_results_{int(time.time())}.md"
         summary_filename = filename.replace(".md", "_summary.md")
@@ -487,7 +490,6 @@ class AgentLoop:
         summary = create_extractive_summary(safe_obs, query)
 
         # Fire-and-forget: write both files in the background.
-        # User gets the result now; files will be on disk in < 1s.
         async def _write_files() -> None:
             try:
                 await dispatch_with_retry(
@@ -506,7 +508,6 @@ class AgentLoop:
 
         asyncio.create_task(_write_files())
 
-        # Build and stream immediate response — don't wait for file writes.
         immediate_response = (
             f"✅ **Search complete!** Full results saved to `{filename}`\n"
             f"📄 **Summary created:** `{summary_filename}`\n\n"

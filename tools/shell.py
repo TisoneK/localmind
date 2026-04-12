@@ -475,6 +475,9 @@ async def shell_exec(message: str) -> ToolResult:
             content="Shell tool is disabled. Set LOCALMIND_SHELL_ENABLED=true in .env to enable it.",
             risk=RiskLevel.LOW,
             source="shell",
+            success=False,
+            error_type="permission",
+            error_message="Shell tool disabled via LOCALMIND_SHELL_ENABLED.",
         )
 
     try:
@@ -490,6 +493,9 @@ async def shell_exec(message: str) -> ToolResult:
             risk=RiskLevel.HIGH,
             source="shell",
             metadata={"traceback": traceback.format_exc()},
+            success=False,
+            error_type="internal_error",
+            error_message=str(exc),
         )
 
 # ---------------------------------------------------------------------------

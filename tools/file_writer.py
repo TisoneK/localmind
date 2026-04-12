@@ -87,7 +87,14 @@ async def _do_write(filepath: Path, content: str) -> ToolResult:
         )
     except Exception as e:
         logger.error(f"[file_writer] {e}")
-        return ToolResult(content=f"Write failed: {e}", risk=RiskLevel.MEDIUM, source="file_writer")
+        return ToolResult(
+            content=f"Write failed: {e}",
+            risk=RiskLevel.MEDIUM,
+            source="file_writer",
+            success=False,
+            error_type="internal_error",
+            error_message=str(e),
+        )
 
 
 async def write_file(message: str) -> ToolResult:

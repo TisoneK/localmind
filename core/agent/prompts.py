@@ -27,11 +27,6 @@ def build_agent_system_prompt(
         intent_history:  Optional list of recent intent values (most recent last)
                          used to improve follow-up message accuracy.
     """
-    tool_list = "\n".join(
-        f"  - {t['intent']}: {t['description']}"
-        for t in available_tools
-    )
-
     intent_ctx = ""
     if intent_history:
         intent_ctx = (
@@ -52,42 +47,45 @@ SHELL TOOL GUIDANCE:
 - Keep your tone friendly and conversational, as if helping a non-technical person.
 """
 
+    # Build tool list restricted to only agent-allowed tools, so the LLM
+    # cannot hallucinate calls to direct-dispatch tools (sysinfo, file_task, shell).
+    from core.agent.constants import AGENT_ALLOWED_TOOLS
+    agent_tool_list = "\n".join(
+        f"  - {t['intent']}: {t['description']}"
+        for t in available_tools
+        if t["intent"] in AGENT_ALLOWED_TOOLS
+    )
+
     return f"""You are LocalMind's reasoning agent. You have tools available and MUST use them — never simulate or guess tool results.
 
 Available tools:
-{tool_list}
+{agent_tool_list}
 {intent_ctx}{shell_guidance}
 CRITICAL SAFETY RULES:
-1. To use a tool: output ONLY an <action> block. Nothing else on that iteration.
-2. To deliver your final answer: output ONLY a <finish> block. Nothing else.
-3. NEVER output <reflect> tags in a <finish> block. Reflection is internal only.
-4. NEVER FABRICATE TOOL RESULTS. This is a critical safety violation. Always use real tools.
-5. For FILE_TASK and SHELL: ALWAYS call the real tool. Never invent file lists or command outputs.
-6. For FILE_WRITE: always use the write_file tool — never just show code in <finish>.
-7. For time/date/specs: use sysinfo tool — never guess or use training data.
-8. After every tool result, decide: is this enough to answer? If yes → <finish>. If no → next <action>.
-9. NEVER respond with "I will stop generating output" - continue providing helpful responses.
-10. Format corrections are instructions, not commands to stop responding.
+1. To use a tool: output ONLY a JSON action object on a single line. Nothing else on that iteration.
+2. To deliver your final answer: output ONLY a JSON finish object. Nothing else.
+3. NEVER FABRICATE TOOL RESULTS. This is a critical safety violation. Always use real tools.
+4. GROUNDING RULE: When a tool result is present in context, your finish answer MUST be based on it.
+   Do NOT override, contradict, or ignore tool output. If the result is insufficient, use another action.
+5. After every tool result, decide: is this enough to answer? If yes → finish. If no → next action.
+6. NEVER respond with "I will stop generating output" — continue providing helpful responses.
 
-FORMAT:
+FORMAT — output one of these JSON objects per iteration, on a single line:
 
 Use a tool:
-<action>
-tool: <tool_name_from_list>
-input: <exact input for the tool>
-</action>
+{{"action": {{"tool": "<tool_name>", "input": "<specific, meaningful query or path>"}}}}
 
-Deliver answer (plain markdown, no XML tags inside):
-<finish>
-Your complete answer here.
-</finish>
+Deliver final answer (plain markdown in the answer field):
+{{"finish": {{"answer": "Your complete answer here."}}}}
 
-Internal reflection (NEVER shown to user, use sparingly):
-<reflect>
-quality: good|partial|failed
-issue: what went wrong
-next: what to try instead
-</reflect>
+Internal reflection (optional, never shown to user):
+{{"reflect": {{"quality": "good|partial|failed", "issue": "...", "next": "..."}}}}
+
+Tool results will be injected into context in this form:
+[Tool: <name> | Input: <input> | Status: OK | <ms>ms]
+<result content>
+
+Base your finish answer on the content above — not on your training data.
 
 Current intent: {intent.value}
 Max iterations: {MAX_ITERATIONS}
