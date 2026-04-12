@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     localmind_agent_max_iterations: int = 6
 
     # Permission gates — require user confirmation before write/delete
-    localmind_require_write_permission: bool = True
+    localmind_require_write_permission: bool = False
 
     def resolve_paths(self) -> None:
         """Resolve dynamic paths after init. Call once at startup."""

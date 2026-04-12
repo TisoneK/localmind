@@ -12,6 +12,7 @@ Architecture:
 - Tier 3: Brave - Premium optional layer, requires API key
 """
 from __future__ import annotations
+import asyncio
 import logging
 from core.models import Intent, ToolResult, RiskLevel
 from tools import register_tool
@@ -23,7 +24,6 @@ SNIPPET_MAX = 300
 
 
 async def _search_ddg(query: str) -> tuple[list[dict], str, str]:
-    import asyncio
     try:
         from ddgs import DDGS
         safe_query = query.encode("utf-8", errors="replace").decode("utf-8")
@@ -80,13 +80,24 @@ async def _search_searxng(query: str, searxng_url: str = "https://searx.be") -> 
     except asyncio.TimeoutError:
         logger.warning(f"[web_search] SearXNG timed out after 15s")
         return [], "timeout", f"SearXNG search timed out after 15 seconds"
+    except httpx.ConnectError as e:
+        logger.warning(f"[web_search] SearXNG connection failed: {e}")
+        return [], "network", f"SearXNG instance unreachable at {searxng_url} - check internet connection"
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"[web_search] SearXNG HTTP error: {e.response.status_code}")
+        if e.response.status_code == 404:
+            return [], "network", f"SearXNG instance not found at {searxng_url}"
+        elif e.response.status_code >= 500:
+            return [], "network", f"SearXNG server error (HTTP {e.response.status_code})"
+        else:
+            return [], "network", f"SearXNG returned HTTP {e.response.status_code}"
     except Exception as e:
         logger.warning(f"[web_search] SearXNG failed: {repr(e)}")
         error_str = str(e)
-        if "404" in error_str or "connection" in error_str.lower():
-            return [], "network", f"SearXNG instance unavailable at {searxng_url}"
-        elif "timeout" in error_str.lower():
+        if "timeout" in error_str.lower():
             return [], "timeout", "SearXNG search timed out"
+        elif "json" in error_str.lower():
+            return [], "network", f"SearXNG returned invalid JSON - instance may be misconfigured"
         else:
             return [], "network", f"SearXNG search error: {error_str}"
 
@@ -108,12 +119,24 @@ async def _search_brave(query: str, api_key: str) -> tuple[list[dict], str, str]
                 for w in data.get("web", {}).get("results", [])
             ]
             return results, "", ""
+    except asyncio.TimeoutError:
+        logger.warning("[web_search] Brave timed out after 10s")
+        return [], "timeout", "Brave Search API timed out after 10 seconds"
+    except httpx.ConnectError as e:
+        logger.warning(f"[web_search] Brave connection failed: {e}")
+        return [], "network", f"Brave Search API unreachable - check internet connection"
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"[web_search] Brave HTTP error: {e.response.status_code}")
+        if e.response.status_code == 422:
+            return [], "api_key", "Brave Search API key invalid or request format error (HTTP 422)"
+        elif e.response.status_code == 401:
+            return [], "api_key", "Brave Search API key unauthorized (HTTP 401)"
+        else:
+            return [], "network", f"Brave Search API returned HTTP {e.response.status_code}"
     except Exception as e:
         logger.warning(f"[web_search] Brave failed: {repr(e)}")
         error_str = str(e)
-        if "422" in error_str:
-            return [], "api_key", "Brave Search API key invalid or request format error (HTTP 422)"
-        elif "timeout" in error_str.lower():
+        if "timeout" in error_str.lower():
             return [], "timeout", "Brave Search API timed out"
         else:
             return [], "network", f"Brave Search API error: {error_str}"

@@ -1,6 +1,3 @@
-import { useHealth } from '../hooks/useHealth'
-import { useSession } from '../hooks/useSession'
-
 const S = {
   bar: {
     display: 'flex',
@@ -40,20 +37,20 @@ const S = {
   },
 }
 
-export function StatusBar({ onNewChat, sessionId }) {
-  const { health, loading } = useHealth()
-  const { getSessionTitle } = useSession()
-
+/**
+ * StatusBar receives health + sessionTitle as props from App.
+ * It no longer owns hook instances — App is the single source of truth.
+ */
+export function StatusBar({ onNewChat, sessionId, health, sessionTitle }) {
   const ok = health?.ollama_reachable === true
   const model = health?.model || '---'
-  const status = loading ? 'connecting...' : ok ? 'connected' : 'Ollama offline'
-  
-  const sessionTitle = sessionId ? getSessionTitle(sessionId) : null
+  const status = health == null ? 'connecting...' : ok ? 'connected' : 'Ollama offline'
+
   const displayTitle = sessionTitle || (sessionId ? `#${sessionId.slice(0, 8)}` : null)
 
   return (
     <div style={S.bar}>
-      <div style={S.dot(ok && !loading)} />
+      <div style={S.dot(ok)} />
       <span style={S.label}>{status}</span>
       {ok && <span style={S.model}>{model}</span>}
       <div style={S.spacer} />

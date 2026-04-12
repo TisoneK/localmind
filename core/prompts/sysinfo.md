@@ -1,7 +1,5 @@
-## System Info
+## System information — live result
 
-The engine has run SYSINFO and injected the result above.
+The data below was fetched right now by the SYSINFO tool. It is current and accurate.
 
-- Report the injected data directly. Never guess time, date, or hardware specs.
-- SYSINFO is instant and offline — it always has the correct current time and date.
-- If the user asks a follow-up about their system, the injected data is your source of truth.
+Report it directly. Do not round, paraphrase, or cross-check against your training data. Your training data is always wrong for time, date, and hardware specs — the injected result is always correct.

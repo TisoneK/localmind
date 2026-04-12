@@ -394,9 +394,17 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     if knowledge:
         base_system_tokens += knowledge_tokens + 4
 
+    # Cap response_reserve to at most 40% of the context window.
+    # Without this, a model with a small declared context window (e.g. an
+    # incorrectly configured entry) combined with a large reserve causes
+    # total_available to collapse to 64 tokens, breaking all tool responses.
+    effective_reserve = min(
+        settings.localmind_response_reserve_tokens,
+        round(model_context_window * 0.40),
+    )
     total_available = max(
         model_context_window
-        - settings.localmind_response_reserve_tokens
+        - effective_reserve
         - base_system_tokens
         - 16,
         64,  # hard floor — always fit at least the current message
@@ -417,10 +425,17 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
     if knowledge:
         system_parts.append(f"\n\n---\n\n{knowledge}")
 
-    # Inject memory facts (small — no dedicated budget needed)
+    # Inject memory facts — framed explicitly so the model treats them as
+    # retrieved data, not suggestions to ignore.
     if context.memory_facts:
         facts_text = "\n".join(f"- {f}" for f in context.memory_facts)
-        system_parts.append(f"\n\nThings you remember about the user:\n{facts_text}")
+        system_parts.append(
+            f"\n\n## Retrieved memory — facts stored from previous conversations\n"
+            f"These were retrieved from your vector memory store right now. "
+            f"They are things the user told you or that you learned in past sessions. "
+            f"Use them to answer questions about the user or their machine.\n"
+            f"{facts_text}"
+        )
 
     system_content = "".join(system_parts)
     messages.append({"role": "system", "content": system_content})
@@ -434,8 +449,11 @@ def build(context: EngineContext, model_context_window: int = 8192) -> list[dict
         safe_tool_content = _truncate_to_token_budget(
             raw_tool_content, tool_budget, label=f"tool:{context.tool_result.source}"
         )
+        source = context.tool_result.source
         tool_msg_content = (
-            f"[Tool result from {context.tool_result.source}]\n{safe_tool_content}"
+            f"[Live result from {source} — retrieved just now]\n\n"
+            f"{safe_tool_content}\n\n"
+            f"Use the values above to answer the user. Do not substitute your own estimates."
         )
         messages.append({"role": "system", "content": tool_msg_content})
         logger.debug(

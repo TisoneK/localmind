@@ -55,22 +55,6 @@ async def _event_stream(
     file_name_written = None
     captured_intent = None
 
-    # Store user message with file information
-    from storage.db import SessionStore
-    from core.models import Message, Role
-
-    store = SessionStore(settings.localmind_db_path)
-    user_message = Message(
-        role=Role.USER,
-        content=message,
-        file_name=filename,
-        file_path=file_full_path,
-        file_size=len(file_bytes) if file_bytes else None,
-        file_type=content_type
-    )
-    store.append(session_id, user_message)
-    logger.info(f"Stored user message with file: {filename}")
-
     try:
         async for chunk in _engine.process(
             message=message,
@@ -183,6 +167,7 @@ async def _event_stream(
     except Exception as e:
         logger.error(f"Stream error: {e}", exc_info=True)
         yield _sse({"error": str(e), "done": True})
+        yield _sse({"type": "stream_closed", "done": True})  # Ensure proper stream closure
 
 
 @router.post("/chat")
@@ -209,22 +194,38 @@ async def chat(
     file_content_type = None
 
     if file and file.filename:
-        file_bytes = await file.read()
-        if len(file_bytes) > MAX_FILE_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum {settings.localmind_max_file_size_mb} MB.",
+        try:
+            file_bytes = await file.read()
+            if len(file_bytes) > MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum {settings.localmind_max_file_size_mb} MB.",
+                )
+            # Save uploaded file to uploads dir
+            uploads_dir = Path(settings.localmind_uploads_path)
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            dest = uploads_dir / file.filename
+            dest.write_bytes(file_bytes)
+            filename = file.filename
+            file_content_type = file.content_type or "application/octet-stream"
+            # Use client-provided full path if given, otherwise use uploads dir path
+            if not file_full_path:
+                file_full_path = str(dest)
+            logger.info(f"[chat] File uploaded successfully: {filename}, {len(file_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"[chat] File upload error: {e}", exc_info=True)
+            # Return error as SSE instead of breaking the stream
+            async def error_stream():
+                yield _sse({"error": f"File upload failed: {e}", "done": True})
+            return StreamingResponse(
+                error_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "X-Session-ID": sid,
+                },
             )
-        # Save uploaded file to uploads dir
-        uploads_dir = Path(settings.localmind_uploads_path)
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-        dest = uploads_dir / file.filename
-        dest.write_bytes(file_bytes)
-        filename = file.filename
-        file_content_type = file.content_type or "application/octet-stream"
-        # Use client-provided full path if given, otherwise use uploads dir path
-        if not file_full_path:
-            file_full_path = str(dest)
 
     return StreamingResponse(
         _event_stream(

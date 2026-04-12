@@ -1,11 +1,11 @@
 """
 Ollama lifecycle routes — F1
 
-POST /api/ollama/start         — start `ollama serve` as a subprocess
-GET  /api/ollama/status        — is Ollama reachable + loaded models
-POST /api/ollama/pull          — stream `ollama pull <model>` progress as SSE
-GET  /api/models               — list installed models with metadata
-POST /api/models/select        — switch active model for the session
+POST /api/ollama/start   — start `ollama serve` as a subprocess
+GET  /api/ollama/status  — is Ollama reachable + loaded models
+POST /api/ollama/pull    — stream `ollama pull <model>` progress as SSE
+
+NOTE: GET /api/models and POST /api/models/select live in api/routes/models.py.
 """
 from __future__ import annotations
 import asyncio
@@ -141,71 +141,3 @@ async def ollama_pull(req: PullRequest):
     return StreamingResponse(_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-
-# ── /api/models ───────────────────────────────────────────────────────────
-
-class ModelInfo(BaseModel):
-    name: str
-    size_gb: Optional[float]
-    context_window: Optional[int]
-    active: bool
-
-
-@router.get("/models", response_model=list[ModelInfo])
-async def list_models():
-    tags = await _ollama_get("/api/tags")
-    if tags is None:
-        raise HTTPException(status_code=503, detail="Ollama is not reachable.")
-
-    result = []
-    for m in tags.get("models", []):
-        name = m.get("name", "")
-        size_bytes = m.get("size", 0)
-        size_gb = round(size_bytes / 1e9, 2) if size_bytes else None
-        # Context window lives in model details — fetch lazily
-        ctx = None
-        try:
-            details = await _ollama_get(f"/api/show")  # would need POST with name; skip for now
-        except Exception:
-            pass
-        result.append(ModelInfo(
-            name=name,
-            size_gb=size_gb,
-            context_window=ctx,
-            active=(name == settings.ollama_model or name.split(":")[0] == settings.ollama_model),
-        ))
-    return result
-
-
-# ── /api/models/select ────────────────────────────────────────────────────
-
-class SelectModelRequest(BaseModel):
-    model: str
-
-
-class SelectModelResponse(BaseModel):
-    selected: str
-    message: str
-
-
-@router.post("/models/select", response_model=SelectModelResponse)
-async def select_model(req: SelectModelRequest):
-    """Switch active model for the current server process (runtime override)."""
-    # Verify the model exists in Ollama
-    tags = await _ollama_get("/api/tags")
-    if tags is None:
-        raise HTTPException(status_code=503, detail="Ollama is not reachable.")
-
-    available = [m["name"] for m in tags.get("models", [])]
-    # Accept bare name match (e.g. "llama3" matches "llama3:latest")
-    matched = next(
-        (n for n in available if n == req.model or n.startswith(req.model + ":")),
-        None,
-    )
-    if not matched:
-        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not found in Ollama.")
-
-    # Mutate settings at runtime (affects new requests; existing streams unaffected)
-    settings.ollama_model = matched
-    logger.info(f"Active model switched to {matched}")
-    return SelectModelResponse(selected=matched, message=f"Active model is now {matched}.")

@@ -164,39 +164,64 @@ async def parse_file(
     """Parse raw file bytes into a FileAttachment with text chunks."""
     from core.config import settings
 
+    if not data:
+        logger.warning(f"[file_reader] Empty file data for {filename}")
+        return FileAttachment(
+            filename=filename,
+            content_type=content_type,
+            size_bytes=0,
+            chunks=["[Empty file]"],
+        )
+
     ext = Path(filename).suffix.lower()
     overlap = getattr(settings, "localmind_chunk_overlap_tokens", 200)
-    logger.info(f"[file_reader] Processing file: {filename}, ext: {ext}, content_type: {content_type}")
+    logger.info(f"[file_reader] Processing file: {filename}, ext: {ext}, content_type: {content_type}, size: {len(data)} bytes")
 
-    if ext == ".pdf" or content_type == "application/pdf":
-        text = await _parse_pdf(data)
-    elif ext == ".docx":
-        text = await _parse_docx(data)
-    elif ext in (".csv", ".xlsx"):
-        text = await _parse_csv_xlsx(data, filename)
-    elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"):
-        text = await _parse_image(data, filename)
-    else:
-        # Plain text / code — decode as UTF-8 with a hard size cap to prevent
-        # context overflow. Files larger than FILE_READ_MAX_BYTES are truncated
-        # with a notice so the model knows content was cut.
-        try:
-            raw = data[:FILE_READ_MAX_BYTES]
-            text = raw.decode("utf-8", errors="replace")
-            if len(data) > FILE_READ_MAX_BYTES:
-                truncated_kb = FILE_READ_MAX_BYTES // 1024
-                original_kb = len(data) // 1024
-                text += (
-                    f"\n\n[... file truncated: showing first {truncated_kb} KB "
-                    f"of {original_kb} KB total. Use shell tool to inspect specific lines ...]"
-                )
-                logger.warning(
-                    f"[file_reader] {filename}: truncated {original_kb} KB → {truncated_kb} KB"
-                )
-        except Exception as e:
-            text = f"[Could not read file: {e}]"
+    text = ""
+    try:
+        if ext == ".pdf" or content_type == "application/pdf":
+            text = await _parse_pdf(data)
+        elif ext == ".docx":
+            text = await _parse_docx(data)
+        elif ext in (".csv", ".xlsx"):
+            text = await _parse_csv_xlsx(data, filename)
+        elif ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"):
+            text = await _parse_image(data, filename)
+        else:
+            # Plain text / code - decode as UTF-8 with a hard size cap to prevent
+            # context overflow. Files larger than FILE_READ_MAX_BYTES are truncated
+            # with a notice so the model knows content was cut.
+            try:
+                raw = data[:FILE_READ_MAX_BYTES]
+                text = raw.decode("utf-8", errors="replace")
+                if len(data) > FILE_READ_MAX_BYTES:
+                    truncated_kb = FILE_READ_MAX_BYTES // 1024
+                    original_kb = len(data) // 1024
+                    text += (
+                        f"\n\n[... file truncated: showing first {truncated_kb} KB "
+                        f"of {original_kb} KB total. Use shell tool to inspect specific lines ...]"
+                    )
+                    logger.warning(
+                        f"[file_reader] {filename}: truncated {original_kb} KB -> {truncated_kb} KB"
+                    )
+            except Exception as e:
+                text = f"[Could not read file: {e}]"
+                logger.error(f"[file_reader] Text decode error for {filename}: {e}")
 
-    chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+        if not text.strip():
+            text = f"[File {filename} appears to be empty or contains no readable text]"
+
+    except Exception as e:
+        logger.error(f"[file_reader] Parse error for {filename}: {e}", exc_info=True)
+        text = f"[File parse error: {e}]"
+
+    try:
+        chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+        if not chunks:
+            chunks = [text]  # Ensure at least one chunk
+    except Exception as e:
+        logger.error(f"[file_reader] Chunking error for {filename}: {e}")
+        chunks = [text]  # Fallback to single chunk
     logger.info(f"[file_reader] parsed {filename}: {len(text)} chars → {len(chunks)} chunks")
     return FileAttachment(
         filename=filename,
@@ -208,13 +233,74 @@ async def parse_file(
 
 async def file_task(message: str, original_path: str = None) -> ToolResult:
     """
-    FILE_TASK dispatch handler - used when no file is attached but the user
-    references a file by name. Returns a prompt to attach the file.
+    FILE_TASK dispatch handler — tries to locate and read a file referenced
+    in the message before falling back to asking the user to attach one.
+
+    Resolution order:
+      1. original_path param (set by engine from prior upload metadata)
+      2. Path extracted from the message text (quoted or bare)
+      3. Prompt user to attach
     """
+    import re as _re
+    from pathlib import Path as _Path
+
+    # Try original_path first (engine passes this for files already uploaded)
+    candidates: list[str] = []
+    if original_path:
+        candidates.append(original_path)
+
+    # Extract file paths / names from the message
+    # Matches: "quoted/path.ext", 'quoted', bare/path.ext, ~/path, ./path
+    path_patterns = [
+        r'''["']([^"'\s]+\.[a-zA-Z0-9]{1,6})["']''',
+        r'((?:~/|\.{0,2}/)?[\w.\-/]+\.(?:py|js|ts|txt|md|csv|pdf|docx|xlsx|json|yaml|yml|toml|html|sh|rs|go|log|cfg|ini|env))',
+    ]
+    for pat in path_patterns:
+        for m in _re.finditer(pat, message):
+            candidates.append(m.group(1))
+
+    # Expand and validate each candidate
+    for raw_path in candidates:
+        p = _Path(raw_path).expanduser()
+        if not p.is_absolute():
+            # Try relative to home and cwd
+            for base in (_Path.home(), _Path.cwd()):
+                candidate = base / p
+                if candidate.exists():
+                    p = candidate
+                    break
+        if p.exists() and p.is_file():
+            try:
+                data = p.read_bytes()
+                attachment = await parse_file(
+                    data=data,
+                    filename=p.name,
+                    content_type="application/octet-stream",
+                )
+                # Return first chunk as tool result; engine injects full attachment separately
+                preview = attachment.chunks[0] if attachment.chunks else "[empty file]"
+                if len(attachment.chunks) > 1:
+                    preview += f"\n\n[... {len(attachment.chunks)-1} more chunks available]"
+                logger.info("[file_task] read file from disk: %s (%d bytes)", p, len(data))
+                return ToolResult(
+                    content=f"File: {p}\nSize: {len(data):,} bytes\n\n{preview}",
+                    risk=RiskLevel.LOW,
+                    source="file_reader",
+                    metadata={"path": str(p), "filename": p.name, "chunks": len(attachment.chunks)},
+                )
+            except Exception as e:
+                logger.warning("[file_task] failed to read %s: %s", p, e)
+                return ToolResult(
+                    content=f"Could not read {p}: {e}",
+                    risk=RiskLevel.LOW,
+                    source="file_reader",
+                )
+
     return ToolResult(
         content=(
-            "To work with a file, please attach it using the paperclip button in the chat interface, "
-            "or use `localmind ask --file <path>` in the CLI."
+            "No file found. To read a file:\n"
+            "- Attach it with the paperclip button in the chat\n"
+            "- Or mention the full path, e.g. \"read ~/Documents/notes.txt\""
         ),
         risk=RiskLevel.LOW,
         source="file_reader",

@@ -51,11 +51,14 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "mixtral:8x7b": 32768,
     "phi3:mini": 4096,
     "gemma2:9b": 8192,
-    # Gemma 3 family — Ollama default context is 2048 for :1b, 8192 for larger
-    "gemma3:1b": 2048,
-    "gemma3:4b": 8192,
-    "gemma3:12b": 8192,
-    "gemma3:27b": 8192,
+    # Gemma 3 family — Ollama supports up to 131072 context for the full family.
+    # The :1b was previously listed as 2048 (a Gemma 2 holdover) which caused
+    # response_reserve (2048) to consume the entire context window, leaving 64
+    # tokens for all content and making every non-trivial request time out.
+    "gemma3:1b":  131072,
+    "gemma3:4b":  131072,
+    "gemma3:12b": 131072,
+    "gemma3:27b": 131072,
 }
 
 

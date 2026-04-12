@@ -46,6 +46,7 @@ from core.intent_router_v2 import RiskAwareRouter, ZONE_AMBER, ZONE_RED
 from core.flywheel import FlywheelLogger
 from core.memory import MemoryComposer
 from core.agent import AgentLoop, AGENT_INTENTS
+from core.workspace.orchestrator import WorkspaceOrchestrator, _should_use_orchestrator
 from core.tool_scorer import best_tool, score_tools, load_reliability_from_db, record_tool_outcome
 from core.obs import ObsCollector
 from core.metrics import MetricsStore  # NEW: aggregated p50/p95 per intent + tool success rates
@@ -122,6 +123,7 @@ class Engine:
         self._adapter = get_adapter(settings.localmind_adapter)
         self._memory = MemoryComposer()
         self._agent_loop = AgentLoop(adapter=self._adapter)
+        self._orchestrator = WorkspaceOrchestrator(adapter=self._adapter)
         self._metrics = MetricsStore()
         self._flywheel = FlywheelLogger()
         self._router = RiskAwareRouter(flywheel=self._flywheel)
@@ -232,13 +234,27 @@ class Engine:
                 session_id=session_id, message=message, intent=Intent.CHAT,
                 history=history, tool_result=None, file_attachment=None, memory_facts=[],
             )
-            prompt_messages = context_builder.build(ctx, self._adapter.context_window)
+            # Use a minimal greeting prompt — the full base+chat prompts contain
+            # tool-authority rules that cause small models to respond to "Hello"
+            # with "Let me check that — I need to use SYSINFO."
+            _greeting_prompt = context_builder._load_fragment("greeting") or \
+                "You are LocalMind, a friendly local AI assistant. Be warm and concise."
+            _greeting_messages = [{"role": "system", "content": _greeting_prompt}]
+            for m in ctx.history[-6:]:  # last 3 turns for continuity
+                if m.role.value in ("user", "assistant"):
+                    _greeting_messages.append({"role": m.role.value, "content": m.content})
+            _greeting_messages.append({"role": "user", "content": message})
+            prompt_messages = _greeting_messages
             full_response: list[str] = []
             async for chunk in self._adapter.chat(prompt_messages, intent="chat"):
                 full_response.append(chunk.text)
                 yield StreamChunk(text=_filter_system_leaks(chunk.text), done=chunk.done)
             response_text = _filter_system_leaks("".join(full_response))
-            self._store.append(session_id, Message(role=Role.USER, content=message))
+            self._store.append(session_id, Message(
+                role=Role.USER, content=message,
+                file_name=filename, file_path=original_path,
+                file_size=len(file) if file else None, file_type=content_type,
+            ))
             self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
             total_ms = round((time.monotonic() - t0) * 1000)
             self._metrics.record("chat", latency_ms=total_ms, success=True)
@@ -299,14 +315,20 @@ class Engine:
         # ── 4. File attachment ─────────────────────────────────────────────
         file_attachment: Optional[FileAttachment] = None
         if file and filename:
-            from tools.file_reader import parse_file
-            file_attachment = await parse_file(
-                data=file,
-                filename=filename,
-                content_type=content_type or "application/octet-stream",
-                chunk_size=settings.localmind_chunk_size_tokens,
-                original_path=original_path,
-            )
+            try:
+                from tools.file_reader import parse_file
+                file_attachment = await parse_file(
+                    data=file,
+                    filename=filename,
+                    content_type=content_type or "application/octet-stream",
+                    chunk_size=settings.localmind_chunk_size_tokens,
+                    original_path=original_path,
+                )
+                logger.info(f"[engine] File parsed successfully: {filename}, {len(file)} bytes")
+            except Exception as e:
+                logger.error(f"[engine] File parsing failed: {e}", exc_info=True)
+                # Continue without file attachment rather than breaking the stream
+                file_attachment = None
 
         # ── 5. Memory retrieval ────────────────────────────────────────────
         # Fast-path: skip memory retrieval for short CHAT queries (no meaningful matches)
@@ -325,6 +347,40 @@ class Engine:
             _obs.emit("memory_retrieved",
                       facts=len(memory_facts),
                       latency_ms=round((time.monotonic() - t_mem) * 1000))
+
+        # ── 5b. Workspace orchestrator — parallel track ───────────────────
+        # For multi-step requests (compare, write a report, search-then-save…)
+        # the orchestrator handles the full plan → dispatch → synthesise cycle.
+        # It streams directly to the user and returns, bypassing steps 6–10.
+        # Single-tool requests skip this block entirely (fast path unchanged).
+        if _should_use_orchestrator(message, effective_intent):
+            _obs.emit("workspace_orchestrator_start", intent=effective_intent.value)
+            full_response_chunks: list[str] = []
+            async for chunk in self._orchestrator.run(
+                message=message,
+                session_id=session_id,
+                memory_facts=memory_facts,
+                obs=_obs,
+            ):
+                safe = _filter_system_leaks(chunk.text)
+                full_response_chunks.append(safe)
+                yield StreamChunk(text=safe, done=chunk.done)
+
+            response_text = "".join(full_response_chunks)
+            self._store.append(session_id, Message(
+                role=Role.USER, content=message,
+                file_name=filename, file_path=original_path,
+                file_size=len(file) if file else None, file_type=content_type,
+            ))
+            self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
+            total_ms = round((time.monotonic() - t0) * 1000)
+            self._metrics.record(effective_intent.value, latency_ms=total_ms, success=True)
+            _obs.emit("turn_complete", intent=effective_intent.value,
+                      confidence=round(confidence, 2),
+                      tokens_approx=_approx_tokens(response_text),
+                      total_latency_ms=total_ms, memory_facts=len(memory_facts),
+                      agent_mode=True)
+            return
 
         # ── 6. Tool dispatch ───────────────────────────────────────────
         tool_result: Optional[ToolResult] = None
@@ -385,7 +441,11 @@ class Engine:
                 if effective_intent == Intent.SYSINFO and tool_result and tool_result.content:
                     result_text = tool_result.content.strip()
                     _obs.emit("tool_status", tool="sysinfo", label="Getting system info", status="done")
-                    self._store.append(session_id, Message(role=Role.USER, content=message))
+                    self._store.append(session_id, Message(
+                        role=Role.USER, content=message,
+                        file_name=filename, file_path=original_path,
+                        file_size=len(file) if file else None, file_type=content_type,
+                    ))
                     self._store.append(session_id, Message(role=Role.ASSISTANT, content=result_text))
                     total_ms = round((time.monotonic() - t0) * 1000)
                     self._metrics.record("sysinfo", latency_ms=total_ms, success=True)
@@ -403,8 +463,61 @@ class Engine:
                 self._flywheel.mark_tool_failure(_query_id)
                 tool_result = None
         
+        # ── FILE_TASK fast-path for uploaded files ────────────────────────
+        # The file already read in ~0ms. The only remaining work is the LLM
+        # call that processes the content. On small models (gemma3:1b etc.)
+        # the full context_builder pipeline injects history + memory + system
+        # prompt + tool result + file chunks, easily blowing the context window
+        # and causing a 180s timeout with no output.
+        #
+        # Fix: build a minimal prompt — system instruction + file content +
+        # user message ONLY. No history. No memory. No tool_result duplication.
+        # Token budget capped to 60% of context window to leave headroom for
+        # generation. Stream directly and return, bypassing steps 7-10 build.
+        if effective_intent == Intent.FILE_TASK and file_attachment:
+            _obs.emit("tool_status", tool="file_task", label="Reading file", status="done")
+            active_adapter = self._adapter_for(effective_intent)
+            cw = active_adapter.context_window
+
+            # Build file content block — cap to 55% of context window
+            file_char_budget = round(cw * 0.55) * 4  # ~4 chars/token
+            all_chunks = "\n\n---\n\n".join(file_attachment.chunks)
+            if len(all_chunks) > file_char_budget:
+                all_chunks = all_chunks[:file_char_budget] + "\n\n[... truncated]"
+
+            _file_system = (
+                "You are LocalMind. A file has been uploaded. Read it carefully and respond to the user's request.\n"
+                "Only reference content that is actually in the file. Be concise.\n\n"
+                f"[File: {file_attachment.filename}]\n{all_chunks}"
+            )
+            _file_messages = [
+                {"role": "system", "content": _file_system},
+                {"role": "user",   "content": message},
+            ]
+
+            # Use the chat adapter with proper parameters
+            full_response: list[str] = []
+            async for chunk in active_adapter.chat(_file_messages, temperature=0.0):
+                safe = _filter_system_leaks(chunk.text)
+                full_response.append(safe)
+                yield StreamChunk(text=safe, done=chunk.done)
+
+            response_text = "".join(full_response)
+            _obs.emit("tool_status", tool="file_task", label="Reading file", status="done")
+            self._store.append(session_id, Message(
+                role=Role.USER, content=message,
+                file_name=filename, file_path=original_path,
+                file_size=len(file) if file else None, file_type=content_type,
+            ))
+            self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
+            total_ms = round((time.monotonic() - t0) * 1000)
+            self._metrics.record("file_task", latency_ms=total_ms, success=True)
+            _obs.emit("turn_complete", intent="file_task", confidence=round(confidence, 2),
+                      tokens_approx=_approx_tokens(response_text), total_latency_ms=total_ms,
+                      memory_facts=len(memory_facts), agent_mode=False)
+            return
         # Agent intents (WEB_SEARCH, CODE_EXEC, FILE_WRITE, MEMORY_OP) get tool result in agent loop
-        elif effective_intent in AGENT_INTENTS:
+        if effective_intent in AGENT_INTENTS:
             # No initial dispatch - agent loop handles it
             pass
         
@@ -508,7 +621,11 @@ class Engine:
         )
 
         # ── 10. Persist history ────────────────────────────────────────────
-        self._store.append(session_id, Message(role=Role.USER, content=message))
+        self._store.append(session_id, Message(
+            role=Role.USER, content=message,
+            file_name=filename, file_path=original_path,
+            file_size=len(file) if file else None, file_type=content_type,
+        ))
         self._store.append(session_id, Message(role=Role.ASSISTANT, content=response_text))
 
         total_ms = round((time.monotonic() - t0) * 1000)
